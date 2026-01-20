@@ -1,0 +1,6 @@
+id: energia-api
+namespace: energia-prod
+secret:
+  name: api-tls
+  key: keystore.jks
+mtls: true
