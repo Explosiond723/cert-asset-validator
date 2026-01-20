@@ -18,7 +18,7 @@ def validate_config(cfg: dict) -> None:
 
     return None
 
-with open("example.yaml", "rt") as source_yaml:
+with open("example-cfg.yaml", "rt") as source_yaml:
     #print(source_yaml.read())
     my_dict = yaml.safe_load(source_yaml)
 
