@@ -73,21 +73,38 @@ truststore:
 mtls: true
 ```
 ---
-##How it works (today)
+## How it works (today)
 1. Load a YAML configuration file
 2. Validate mandatory fields and structure
 3. Stop execution if the configuration is invalid
 4. Print a short summary if validation succeeds
 
 ---
-##How to run
+## Build & run
+
+### Dependencies
+- Python 3.9+
+- `pyyaml`
+
+Install dependencies:
+```bash
+python -m pip install -r requirements.txt
+```
+
+If you prefer not to use a requirements file:
+```bash
+python -m pip install pyyaml
+```
+
+### Run
 ```bash
 python main.py
 ```
-The script currently expects example-cfg.yaml in the project root.
+
+The script currently expects `example-cfg.yaml` in the project root.
 
 ---
-##Roadmap (planned)
+## Roadmap (planned)
 - Extend validation to fully match the configuration schema
 - Introduce warnings vs errors
 - Support multiple certificate asset definitions
