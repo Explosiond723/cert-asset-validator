@@ -1,5 +1,16 @@
 import yaml
 
+def load_assets(path: str) -> list[dict]:
+    with open(path, "rt") as cfg_file:
+        data = yaml.safe_load(cfg_file)
+    if data is None:
+        raise ValueError(f"ERROR: config file is empty")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    raise ValueError(f"ERROR: config root must be a dict or a list of dicts")
+
 def require_path(cfg: dict, path: str):
     cur = cfg
     for part in path.split("."):
@@ -55,12 +66,20 @@ def validate_config(cfg: dict) -> None:
     if "mtls" in cfg and not isinstance(cfg["mtls"], bool):
         raise ValueError("ERROR: Field 'mtls' must be boolean")
 
-with open("example-cfg.yaml", "rt") as f:
-    cfg = yaml.safe_load(f)
+### MAIN ###
 
-validate_config(cfg)
+FILENAME = "example-cfg.yaml"
 
-print("Asset ID: ", cfg["id"])
-print("Namespace: ", cfg["namespace"])
-print("certType: ", cfg["certType"])
-print("mTLS: ", cfg.get("mtls", False))
+assets = load_assets(FILENAME)
+for i, cfg in enumerate(assets):
+    try:
+        validate_config(cfg)
+        #print_summary(cfg) # -> for debug purposes, not implemented yet, just a placeholder
+    except ValueError as VE:
+        asset_id = cfg.get("id", f"asset[{i}]")
+        raise ValueError(f"{asset_id}: {VE}")
+    print("Asset ID: ", cfg["id"])
+    print("Namespace: ", cfg["namespace"])
+    print("certType: ", cfg["certType"])
+    print("mTLS: ", cfg.get("mtls", False))
+    print("----")
