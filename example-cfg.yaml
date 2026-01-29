@@ -1,39 +1,56 @@
-id: energia-api
-namespace: energia-prod
+- id: energia-api
+  namespace: energia-prod
 
-# certType defines how the certificate material must be handled.
-# If certType requires a password (e.g. keystore, pkcs12),
-# a passwordRef MUST be provided.
-# If certType does NOT require a password (e.g. crt, pem),
-# passwordRef is NOT required and will be ignored.
-certType: keystore  # allowed values: keystore, pkcs12, crt, pem, ...
+  # certType defines how the certificate material must be handled.
+  # If certType requires a password (e.g. keystore, pkcs12),
+  # a passwordRef MUST be provided.
+  # If certType does NOT require a password (e.g. crt, pem),
+  # passwordRef is NOT required and will be ignored.
+  certType: keystore  # allowed values: keystore, pkcs12, crt, pem, ...
 
-keystore:
-  secret:
-    # Kubernetes/OpenShift Secret containing the keystore file
-    name: tls-secret
-    # Key inside secret.data[] that holds the keystore (e.g. JKS or PKCS12)
-    key: keystore.jks
+  keystore:
+    secret:
+      # Kubernetes/OpenShift Secret containing the keystore file
+      name: tls-secret
+      # Key inside secret.data[] that holds the keystore (e.g. JKS or PKCS12)
+      key: keystore.jks
 
-  passwordRef:
-    # Reference to the Secret containing the keystore password
-    # (password stored in a DIFFERENT Secret)
-    name: tls-pass
-    key: keystorePassword
+    passwordRef:
+      # Reference to the Secret containing the keystore password
+      # (password stored in a DIFFERENT Secret)
+      name: tls-pass
+      key: keystorePassword
 
-truststore:
-  secret:
-    # Kubernetes/OpenShift Secret containing the truststore file
-    name: tls-secret
-    # Key inside secret.data[] that holds the truststore
-    key: truststore.jks
+  truststore:
+    secret:
+      # Kubernetes/OpenShift Secret containing the truststore file
+      name: tls-secret
+      # Key inside secret.data[] that holds the truststore
+      key: truststore.jks
 
-  passwordRef:
-    # Reference to the password used to open the truststore.
-    # In this case, the password is stored in the SAME Secret as the certs,
-    # but uses a DIFFERENT key than the keystore password.
-    name: tls-secret
-    key: truststorePassword
+    passwordRef:
+      # Reference to the password used to open the truststore.
+      # In this case, the password is stored in the SAME Secret as the certs,
+      # but uses a DIFFERENT key than the keystore password.
+      name: tls-secret
+      key: truststorePassword
 
-# Value not required: Enable or disable mutual TLS handling for this asset, if None it defaults to False
-mtls: true
+  mtls: true
+
+
+- id: billing-api
+  namespace: billing-prod
+
+  # PKCS12 example without truststore
+  certType: pkcs12
+
+  keystore:
+    secret:
+      name: billing-tls
+      key: keystore.p12
+
+    passwordRef:
+      name: billing-tls-pass
+      key: keystorePassword
+
+  # mtls intentionally omitted (defaults to False)
