@@ -93,7 +93,7 @@ python -m pip install -r requirements.txt
 
 If you prefer not to use a requirements file:
 ```bash
-python -m pip install pyyaml
+python -m pip install pyyaml cryptography
 ```
 
 ### Run
