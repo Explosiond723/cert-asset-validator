@@ -1,4 +1,5 @@
 import yaml
+import cryptography
 
 def load_assets(path: str) -> list[dict]:
     with open(path, "rt") as cfg_file:
