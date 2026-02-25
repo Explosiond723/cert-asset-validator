@@ -1,5 +1,4 @@
 import yaml
-import cryptography
 
 def load_assets(path: str) -> list[dict]:
     with open(path, "rt") as cfg_file:
@@ -69,18 +68,18 @@ def validate_config(cfg: dict) -> None:
 
 ### MAIN ###
 
-FILENAME = "example-cfg.yaml"
+if __name__ == "__main__":
+    FILENAME = "example-cfg.yaml"
 
-assets = load_assets(FILENAME)
-for i, cfg in enumerate(assets):
-    try:
-        validate_config(cfg)
-        #print_summary(cfg) # -> for debug purposes, not implemented yet, just a placeholder
-    except ValueError as VE:
-        asset_id = cfg.get("id", f"asset[{i}]")
-        raise ValueError(f"{asset_id}: {VE}")
-    print("Asset ID: ", cfg["id"])
-    print("Namespace: ", cfg["namespace"])
-    print("certType: ", cfg["certType"])
-    print("mTLS: ", cfg.get("mtls", False))
-    print("----")
+    assets = load_assets(FILENAME)
+    for i, cfg in enumerate(assets):
+        try:
+            validate_config(cfg)
+        except ValueError as VE:
+            asset_id = cfg.get("id", f"asset[{i}]")
+            raise ValueError(f"{asset_id}: {VE}")
+        print("Asset ID: ", cfg["id"])
+        print("Namespace: ", cfg["namespace"])
+        print("certType: ", cfg["certType"])
+        print("mTLS: ", cfg.get("mtls", False))
+        print("----")
