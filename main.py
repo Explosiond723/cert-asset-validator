@@ -1,4 +1,6 @@
+import argparse
 import yaml
+from cert_analysis import cert_format, cert_metadata_extract, eku_inspect
 
 def load_assets(path: str) -> list[dict]:
     with open(path, "rt") as cfg_file:
@@ -66,12 +68,9 @@ def validate_config(cfg: dict) -> None:
     if "mtls" in cfg and not isinstance(cfg["mtls"], bool):
         raise ValueError("ERROR: Field 'mtls' must be boolean")
 
-### MAIN ###
 
-if __name__ == "__main__":
-    FILENAME = "example-cfg.yaml"
-
-    assets = load_assets(FILENAME)
+def cmd_validate(args):
+    assets = load_assets(args.config)
     for i, cfg in enumerate(assets):
         try:
             validate_config(cfg)
@@ -83,3 +82,35 @@ if __name__ == "__main__":
         print("certType: ", cfg["certType"])
         print("mTLS: ", cfg.get("mtls", False))
         print("----")
+
+
+def cmd_analyse(args):
+    with open(args.cert, "rb") as f:
+        data = f.read()
+    password = args.password if args.password else None
+    detected_type = cert_format(data, args.cert, password)
+    if detected_type is None:
+        print("ERROR: Unable to detect certificate format")
+        return
+    metadata = cert_metadata_extract(data, detected_type, password)
+    eku_inspect(metadata)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="cert-asset-validator")
+    subparsers = parser.add_subparsers(dest="command")
+
+    validate_parser = subparsers.add_parser("validate", help="Validate YAML asset definitions")
+    validate_parser.add_argument("config", help="Path to YAML config file")
+
+    analyse_parser = subparsers.add_parser("analyse", help="Analyse a certificate file")
+    analyse_parser.add_argument("cert", help="Path to certificate file")
+    analyse_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
+
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+    elif args.command == "validate":
+        cmd_validate(args)
+    elif args.command == "analyse":
+        cmd_analyse(args)

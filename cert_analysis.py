@@ -38,7 +38,7 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
     try:
         _key, _cert, _ca_certs = pkcs12.load_key_and_certificates(data, b"")
         print("Certificate format: PKCS12 (password not required to extract metadata)")
-        return "PKCS12NP"
+        return "PKCS12"
     except ValueError:
         # PEM/DER already failed above. If the data starts with an ASN.1 SEQUENCE tag,
         # it's very likely a password-protected PKCS12 (DER certs would have matched earlier).
@@ -106,7 +106,7 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
         print("Certificate metadata extracted successfully")
         return _extract_cert_metadata(cert)
 
-    if cert_type in ("PKCS12NP", "PKCS12"):
+    if cert_type == "PKCS12":
         _key, cert, additional_certs = pkcs12.load_key_and_certificates(
             data, optional_password.encode() if optional_password is not None else None
         )
@@ -170,16 +170,3 @@ def eku_inspect(metadata: dict | list[dict]) -> bool:
 
     print(f"EKU inspection results: Server Auth={has_server_auth}, Client Auth={has_client_auth}")
     return is_mtls_candidate
-    
-
-
-# only for testing purposes, in the final version the input will be taken from command line arguments or from a configuration file,
-# and the output will be a report with all the metadata extracted and any potential issues found.
-if __name__ == "__main__":
-    cert_path = input("insert certificate path:")
-    password = input("Insert additional password if present (leave empty if not needed): ")
-    with open(cert_path, "rb") as f:
-        data = f.read()
-    cert_type = cert_format(data, cert_path, password)
-    metadata = cert_metadata_extract(data, cert_type, password)
-    eku_inspect(metadata)

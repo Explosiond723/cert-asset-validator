@@ -1,8 +1,6 @@
 # cert-asset-validator
 
-Tool to validate, normalize, and inspect **certificate asset definitions** stored as YAML, and **analyse actual certificate files**, designed for Kubernetes / OpenShift workflows.
-
----
+Validate certificate asset definitions (YAML) and analyse certificate files (PEM, DER, PKCS12, JKS) for Kubernetes / OpenShift environments.
 
 ## Purpose
 
@@ -12,124 +10,84 @@ In real-world Kubernetes/OpenShift environments, certificates are often:
 - composed of keystores, truststores, and passwords stored separately
 - documented manually (e.g. spreadsheets)
 
-`cert-asset-validator` aims to replace fragile documentation with a **declarative, version-controlled YAML definition** that can be:
-- validated offline
-- reviewed safely (no secrets stored)
-- used as the foundation for future automation
+`cert-asset-validator` replaces fragile documentation with a **declarative, version-controlled YAML definition** that can be validated offline, reviewed safely (no secrets stored), and used as the foundation for future automation.
 
----
+## Quick start
 
-## What this tool does (current state)
+```bash
+# Install dependencies (Python 3.9+)
+pip install -r requirements.txt
 
-### YAML validation (`main.py`)
-- Parses a YAML certificate asset definition (single or multiple assets)
-- Validates required fields and structure
+# Validate a YAML asset definition
+python main.py validate example-cfg.yaml
+
+# Analyse a certificate file
+python main.py analyse path/to/cert.pem
+
+# Analyse a password-protected PKCS12/JKS keystore
+python main.py analyse path/to/keystore.p12 --password mysecret
+```
+
+Running `python main.py` with no arguments prints usage help.
+
+## Features
+
+### YAML validation (`validate`)
+- Parses single or multiple certificate asset definitions
+- Validates required fields and structure based on `certType`
 - Fails fast with explicit, human-readable errors
-- Prints a minimal summary of each asset
 
-### Certificate analysis (`cert_analysis.py`)
-- Detects certificate format from raw bytes (PEM, DER, PKCS12, JKS)
+### Certificate analysis (`analyse`)
+- Detects format from raw bytes: PEM, DER, PKCS12, JKS
 - Extracts metadata: Subject, Issuer, Serial Number, Validity Period, SANs, EKU
 - Handles password-protected PKCS12 and JKS keystores
-- Inspects Extended Key Usage to flag mTLS candidates (both `serverAuth` and `clientAuth` present)
-
-### Not yet implemented
-- Kubernetes/OpenShift cluster interaction
-- Secret retrieval
-- Integration between YAML validation and certificate analysis (they are separate entry points today)
-- Cross-validation of declared `certType` against detected format
-
----
+- Inspects Extended Key Usage to flag mTLS candidates (`serverAuth` + `clientAuth`)
 
 ## Configuration model
 
 The YAML configuration describes **how certificate material is stored**, not the material itself.
 
-Key design principles:
 - Secrets are **referenced**, never embedded
 - Passwords are **located**, not stored
 - Configuration is separate from runtime cluster data
 
-See `example-cfg.yaml` for a complete reference example.
-
----
-
-## Example
+### Example
 
 ```yaml
-id: energia-api
-namespace: energia-prod
-certType: keystore
+- id: energia-api
+  namespace: energia-prod
+  certType: keystore
 
-keystore:
-  secret:
-    name: tls-secret
-    key: keystore.jks
-  passwordRef:
-    name: tls-pass
-    key: keystorePassword
+  keystore:
+    secret:
+      name: tls-secret
+      key: keystore.jks
+    passwordRef:
+      name: tls-pass
+      key: keystorePassword
 
-truststore:
-  secret:
-    name: tls-secret
-    key: truststore.jks
-  passwordRef:
-    name: tls-secret
-    key: truststorePassword
+  truststore:
+    secret:
+      name: tls-secret
+      key: truststore.jks
+    passwordRef:
+      name: tls-secret
+      key: truststorePassword
 
-mtls: true
-```
----
-## How it works (today)
-
-### YAML validation
-1. Load a YAML configuration file
-2. Validate mandatory fields and structure
-3. Stop execution if the configuration is invalid
-4. Print a short summary if validation succeeds
-
-### Certificate analysis
-1. Read a certificate file from disk
-2. Detect the format (PEM, DER, PKCS12, JKS)
-3. Extract metadata (Subject, Issuer, SANs, EKU, validity dates)
-4. Inspect EKU for mTLS indicators
-
----
-## Build & run
-
-### Dependencies
-- Python 3.9+
-- `pyyaml`
-- `cryptography`
-- `pyjks`
-
-Install dependencies:
-```bash
-python -m pip install -r requirements.txt
+  mtls: true
 ```
 
-### Run
+See `example-cfg.yaml` for a complete reference with multiple assets.
 
-Validate YAML asset definitions:
-```bash
-python main.py
-```
-The script currently expects `example-cfg.yaml` in the project root.
+## Roadmap
 
-Analyse a certificate file:
-```bash
-python cert_analysis.py
-```
-You will be prompted for a file path and an optional password.
-
----
-## Roadmap (planned)
-- Accept YAML config path as a CLI argument
-- Wire certificate analysis into the main validation loop
+- Wire certificate analysis into the YAML validation loop
 - Cross-validate declared `certType` against detected format
-- Introduce warnings vs errors
-- Add mock Secret resolvers for offline testing
-- Integrate Kubernetes/OpenShift Secret retrieval
-- Automate certificate inspection and renewal workflows
+- Kubernetes/OpenShift Secret retrieval (`--live` mode)
+- Auto-generate YAML definitions from cluster state (`discover` subcommand)
 
 See `ROADMAP.md` for the detailed implementation plan.
+
+## License
+
+See `LICENSE`.
