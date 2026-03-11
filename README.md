@@ -5,6 +5,7 @@ Validate certificate asset definitions (YAML) and analyse certificate files (PEM
 ## Purpose
 
 In real-world Kubernetes/OpenShift environments, certificates are often:
+
 - spread across multiple namespaces
 - stored in Secrets with non-standard layouts
 - composed of keystores, truststores, and passwords stored separately
@@ -33,11 +34,13 @@ Running `python main.py` with no arguments prints usage help.
 ## Features
 
 ### YAML validation (`validate`)
+
 - Parses single or multiple certificate asset definitions
 - Validates required fields and structure based on `certType`
 - Fails fast with explicit, human-readable errors
 
 ### Certificate analysis (`analyse`)
+
 - Detects format from raw bytes: PEM, DER, PKCS12, JKS
 - Extracts metadata: Subject, Issuer, Serial Number, Validity Period, SANs, EKU
 - Handles password-protected PKCS12 and JKS keystores
