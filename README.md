@@ -1,22 +1,22 @@
 # cert-asset-validator
 
-Validate certificate asset definitions (YAML) and analyse certificate files (PEM, DER, PKCS12, JKS) for Kubernetes / OpenShift environments.
+Certificate lifecycle management for Kubernetes / OpenShift environments.
 
 ## Purpose
 
 In real-world Kubernetes/OpenShift environments, certificates are often:
 
-- spread across multiple namespaces
+- spread across multiple namespaces and clusters
 - stored in Secrets with non-standard layouts
 - composed of keystores, truststores, and passwords stored separately
-- documented manually (e.g. spreadsheets)
+- duplicated across environments with no single source of truth
 
-`cert-asset-validator` replaces fragile documentation with a **declarative, version-controlled YAML definition** that can be validated offline, reviewed safely (no secrets stored), and used as the foundation for future automation.
+`cert-asset-validator` replaces fragile documentation with a **declarative, version-controlled YAML inventory** that can be validated offline, queried, and used to drive certificate operations across clusters.
 
 ## Quick start
 
 ```bash
-# Install dependencies (Python 3.9+)
+# Install dependencies (Python 3.10+)
 pip install -r requirements.txt
 
 # Validate a YAML asset definition
@@ -33,18 +33,21 @@ Running `python main.py` with no arguments prints usage help.
 
 ## Features
 
-### YAML validation (`validate`)
+### Available now
 
-- Parses single or multiple certificate asset definitions
-- Validates required fields and structure based on `certType`
-- Fails fast with explicit, human-readable errors
+- **YAML validation** (`validate`) — parses single or multiple certificate asset definitions, validates required fields and structure based on `certType`, fails fast with human-readable errors
+- **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates
 
-### Certificate analysis (`analyse`)
+### Planned
 
-- Detects format from raw bytes: PEM, DER, PKCS12, JKS
-- Extracts metadata: Subject, Issuer, Serial Number, Validity Period, SANs, EKU
-- Handles password-protected PKCS12 and JKS keystores
-- Inspects Extended Key Usage to flag mTLS candidates (`serverAuth` + `clientAuth`)
+- **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
+- **Search & query** — find assets by CN, secret name, namespace, or cluster
+- **Cross-reference map** — show where the same cert lives across locations, CA inventory, keystore+truststore relationship analysis
+- **CSR generation** — generate CSRs from existing cert metadata with interactive overrides, reuse keys for mTLS
+- **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
+- **Auto-discovery** — scan clusters and generate YAML inventory from existing Secrets
+
+See `ROADMAP.md` for the detailed implementation plan.
 
 ## Configuration model
 
@@ -52,44 +55,50 @@ The YAML configuration describes **how certificate material is stored**, not the
 
 - Secrets are **referenced**, never embedded
 - Passwords are **located**, not stored
-- Configuration is separate from runtime cluster data
+- Each cluster maps to a kubeconfig context — the tool never stores credentials
 
 ### Example
 
 ```yaml
-- id: energia-api
-  namespace: energia-prod
-  certType: keystore
+clusters:
+  - name: prod-ocp
+    context: prod-ocp-admin
 
-  keystore:
-    secret:
-      name: tls-secret
-      key: keystore.jks
-    passwordRef:
-      name: tls-pass
-      key: keystorePassword
+assets:
+  - id: energia-api
+    cluster: prod-ocp
+    namespace: energia-prod
+    certType: keystore
 
-  truststore:
-    secret:
-      name: tls-secret
-      key: truststore.jks
-    passwordRef:
-      name: tls-secret
-      key: truststorePassword
+    keystore:
+      secret:
+        name: tls-secret
+        key: keystore.jks
+      passwordRef:
+        name: tls-pass
+        key: keystorePassword
 
-  mtls: true
+    truststore:
+      secret:
+        name: tls-secret
+        key: truststore.jks
+      passwordRef:
+        name: tls-secret
+        key: truststorePassword
+
+    mtls: true
 ```
 
-See `example-cfg.yaml` for a complete reference with multiple assets.
+See `example-cfg.yaml` for additional examples.
 
-## Roadmap
+## Authentication
 
-- Wire certificate analysis into the YAML validation loop
-- Cross-validate declared `certType` against detected format
-- Kubernetes/OpenShift Secret retrieval (`--live` mode)
-- Auto-generate YAML definitions from cluster state (`discover` subcommand)
+The tool relies on the user's existing Kubernetes auth context:
 
-See `ROADMAP.md` for the detailed implementation plan.
+- **Kubeconfig** — run `oc login`, `gcloud container clusters get-credentials`, `aws eks update-kubeconfig`, etc. before using the tool. The `context` field in the YAML maps to a kubeconfig context.
+- **In-cluster ServiceAccount** — when running inside a pod, the tool picks up the mounted token automatically. The user creates the ServiceAccount and RBAC.
+
+All cluster operations are opt-in via the `--live` flag. Default behaviour is offline validation only.
 
 ## License
 

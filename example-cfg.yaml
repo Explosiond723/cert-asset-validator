@@ -1,56 +1,89 @@
-- id: energia-api
-  namespace: energia-prod
+# cert-asset-validator configuration
+# This file defines certificate assets across one or more Kubernetes/OpenShift clusters.
 
-  # certType defines how the certificate material must be handled.
-  # If certType requires a password (e.g. keystore, pkcs12),
-  # a passwordRef MUST be provided.
-  # If certType does NOT require a password (e.g. crt, pem),
-  # passwordRef is NOT required and will be ignored.
-  certType: keystore  # allowed values: keystore, pkcs12, crt, pem, ...
+# Each cluster entry maps a logical name to a kubeconfig context.
+# The user must be authenticated (oc login, gcloud, aws eks, etc.) before using --live.
+clusters:
+  - name: prod-ocp
+    context: prod-ocp-admin
 
-  keystore:
-    secret:
-      # Kubernetes/OpenShift Secret containing the keystore file
-      name: tls-secret
-      # Key inside secret.data[] that holds the keystore (e.g. JKS or PKCS12)
-      key: keystore.jks
+  - name: staging-gke
+    context: gke_myproject_us-east1_staging
 
-    passwordRef:
-      # Reference to the Secret containing the keystore password
-      # (password stored in a DIFFERENT Secret)
-      name: tls-pass
-      key: keystorePassword
+# Each asset describes a certificate stored in Kubernetes Secrets.
+# Secrets are referenced by name/key — never embedded.
+assets:
+  - id: energia-api
+    cluster: prod-ocp
+    namespace: energia-prod
 
-  truststore:
-    secret:
-      # Kubernetes/OpenShift Secret containing the truststore file
-      name: tls-secret
-      # Key inside secret.data[] that holds the truststore
-      key: truststore.jks
+    # certType defines how the certificate material must be handled.
+    # If certType requires a password (e.g. keystore, pkcs12),
+    # a passwordRef MUST be provided.
+    # If certType does NOT require a password (e.g. crt, pem),
+    # passwordRef is NOT required and will be ignored.
+    certType: keystore  # allowed values: keystore, pkcs12, crt, pem, ...
 
-    passwordRef:
-      # Reference to the password used to open the truststore.
-      # In this case, the password is stored in the SAME Secret as the certs,
-      # but uses a DIFFERENT key than the keystore password.
-      name: tls-secret
-      key: truststorePassword
+    keystore:
+      secret:
+        # Kubernetes/OpenShift Secret containing the keystore file
+        name: tls-secret
+        # Key inside secret.data[] that holds the keystore (e.g. JKS or PKCS12)
+        key: keystore.jks
 
-  mtls: true
+      passwordRef:
+        # Reference to the Secret containing the keystore password
+        # (password stored in a DIFFERENT Secret)
+        name: tls-pass
+        key: keystorePassword
+
+    truststore:
+      secret:
+        # Kubernetes/OpenShift Secret containing the truststore file
+        name: tls-secret
+        # Key inside secret.data[] that holds the truststore
+        key: truststore.jks
+
+      passwordRef:
+        # Reference to the password used to open the truststore.
+        # In this case, the password is stored in the SAME Secret as the certs,
+        # but uses a DIFFERENT key than the keystore password.
+        name: tls-secret
+        key: truststorePassword
+
+    mtls: true
 
 
-- id: billing-api
-  namespace: billing-prod
+  - id: billing-api
+    cluster: staging-gke
+    namespace: billing-prod
 
-  # PKCS12 example without truststore
-  certType: pkcs12
+    # PKCS12 example without truststore
+    certType: pkcs12
 
-  keystore:
-    secret:
-      name: billing-tls
-      key: keystore.p12
+    keystore:
+      secret:
+        name: billing-tls
+        key: keystore.p12
 
-    passwordRef:
-      name: billing-tls-pass
-      key: keystorePassword
+      passwordRef:
+        name: billing-tls-pass
+        key: keystorePassword
 
-  # mtls intentionally omitted (defaults to False)
+    # mtls intentionally omitted (defaults to False)
+
+
+  - id: public-web
+    cluster: prod-ocp
+    namespace: web-prod
+
+    # PEM example — no password, no truststore
+    certType: pem
+
+    keystore:
+      secret:
+        name: web-tls
+        key: tls.crt
+
+    # No passwordRef needed for PEM
+    # No truststore — this is a simple server cert

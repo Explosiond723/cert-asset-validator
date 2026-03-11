@@ -2,16 +2,37 @@ import argparse
 import yaml
 from cert_analysis import cert_format, cert_metadata_extract, eku_inspect
 
-def load_assets(path: str) -> list[dict]:
+
+def load_config(path: str) -> dict:
+    """Load and normalize the YAML config file.
+
+    Returns a dict with 'clusters' (list of cluster defs) and 'assets' (list of asset defs).
+    Supports both the new multi-cluster format and the legacy flat list format.
+    """
     with open(path, "rt") as cfg_file:
         data = yaml.safe_load(cfg_file)
     if data is None:
-        raise ValueError(f"ERROR: config file is empty")
-    if isinstance(data, list):
-        return data
+        raise ValueError("ERROR: config file is empty")
+
+    # New format: dict with 'clusters' and 'assets' keys
     if isinstance(data, dict):
-        return [data]
-    raise ValueError(f"ERROR: config root must be a dict or a list of dicts")
+        if "assets" in data:
+            clusters = data.get("clusters", [])
+            assets = data["assets"]
+            if not isinstance(assets, list):
+                raise ValueError("ERROR: 'assets' must be a list")
+            if not isinstance(clusters, list):
+                raise ValueError("ERROR: 'clusters' must be a list")
+            return {"clusters": clusters, "assets": assets}
+        # Single asset dict (legacy)
+        return {"clusters": [], "assets": [data]}
+
+    # Legacy format: flat list of assets
+    if isinstance(data, list):
+        return {"clusters": [], "assets": data}
+
+    raise ValueError("ERROR: config root must be a dict or a list of dicts")
+
 
 def require_path(cfg: dict, path: str):
     cur = cfg
@@ -23,13 +44,29 @@ def require_path(cfg: dict, path: str):
         cur = cur[part]
     return cur
 
+
 def require_dict(cfg: dict, path: str) -> dict:
     val = require_path(cfg, path)
     if not isinstance(val, dict):
         raise ValueError(f"ERROR: Field '{path}' must be a dictionary")
     return val
 
-def validate_config(cfg: dict) -> None:
+
+def validate_cluster(cluster: dict) -> None:
+    """Validate a single cluster definition."""
+    if not isinstance(cluster, dict):
+        raise ValueError("ERROR: each cluster entry must be a dictionary")
+    for k in ("name", "context"):
+        if k not in cluster:
+            raise ValueError(f"ERROR: Missing required cluster field: {k}")
+
+
+def validate_config(cfg: dict, cluster_names: list[str]) -> None:
+    """Validate a single asset definition.
+
+    cluster_names is the list of valid cluster names from the clusters section.
+    If empty (legacy mode), the 'cluster' field on assets is not required.
+    """
     if cfg is None or not isinstance(cfg, dict):
         raise ValueError("ERROR: config file not found or not in the correct format")
 
@@ -38,10 +75,19 @@ def validate_config(cfg: dict) -> None:
         if k not in cfg:
             raise ValueError(f"ERROR: Missing required field: {k}")
 
+    # cluster field: required when clusters are defined, must reference a valid name
+    if cluster_names:
+        if "cluster" not in cfg:
+            raise ValueError("ERROR: Missing required field: cluster")
+        if cfg["cluster"] not in cluster_names:
+            raise ValueError(
+                f"ERROR: cluster '{cfg['cluster']}' is not defined in the clusters section"
+            )
+
     cert_type = cfg["certType"]
     needs_password = cert_type in ("keystore", "pkcs12")
 
-    # keystore: required when certType implies it (your current model)
+    # keystore: required when certType implies it
     if needs_password:
         require_dict(cfg, "keystore")
         require_dict(cfg, "keystore.secret")
@@ -70,17 +116,36 @@ def validate_config(cfg: dict) -> None:
 
 
 def cmd_validate(args):
-    assets = load_assets(args.config)
+    config = load_config(args.config)
+    clusters = config["clusters"]
+    assets = config["assets"]
+
+    # Validate cluster definitions
+    cluster_names = []
+    for cluster in clusters:
+        try:
+            validate_cluster(cluster)
+            cluster_names.append(cluster["name"])
+        except ValueError as ve:
+            raise ValueError(f"Cluster config error: {ve}")
+
+    if clusters:
+        print(f"Clusters defined: {', '.join(cluster_names)}")
+        print("----")
+
+    # Validate each asset
     for i, cfg in enumerate(assets):
         try:
-            validate_config(cfg)
-        except ValueError as VE:
+            validate_config(cfg, cluster_names)
+        except ValueError as ve:
             asset_id = cfg.get("id", f"asset[{i}]")
-            raise ValueError(f"{asset_id}: {VE}")
+            raise ValueError(f"{asset_id}: {ve}")
         print("Asset ID: ", cfg["id"])
-        print("Namespace: ", cfg["namespace"])
+        if "cluster" in cfg:
+            print("Cluster:  ", cfg["cluster"])
+        print("Namespace:", cfg["namespace"])
         print("certType: ", cfg["certType"])
-        print("mTLS: ", cfg.get("mtls", False))
+        print("mTLS:     ", cfg.get("mtls", False))
         print("----")
 
 
