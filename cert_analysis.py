@@ -51,8 +51,10 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
                 return "PKCS12"
             except Exception:
                 pass
-        # PEM/DER already failed above. If the data starts with an ASN.1 SEQUENCE tag,
-        # it's very likely a password-protected PKCS12 (DER certs would have matched earlier).
+        # 0x30 is the ASN.1 SEQUENCE tag, the first byte in any DER-encoded structure.
+        # This includes PKCS12 but also other binary formats, so this is a best-guess
+        # heuristic, not a definitive check. It only runs when PEM, DER, and password
+        # verification all failed above, so false positives are unlikely in practice.
         if len(data) > 0 and data[0] == 0x30:
             logger.info("Certificate format: PKCS12 (password required to extract metadata)")
             return "PKCS12"
@@ -130,6 +132,8 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
             )
         except ValueError:
             raise ValueError("ERROR: Unable to decrypt PKCS12 file, try providing a password with --password")
+        except Exception as e:
+            raise ValueError(f"ERROR: Failed to load PKCS12 file: {e}")
         if cert is None:
             raise ValueError("ERROR: Unable to extract metadata from PKCS12 certificate, check if the password is correct and if the file is a valid PKCS12 keystore")
         metadata_list = [_extract_cert_metadata(cert)]
@@ -144,16 +148,20 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
             raise ValueError("ERROR: JKS keystores require a password")
         try:
             ks = jks.KeyStore.loads(data, optional_password)
-            metadata_list = []
-            for alias, entry in ks.entries.items():
-                if isinstance(entry, jks.TrustedCertEntry):
-                    # jks gives raw DER bytes, parse into a cryptography cert object
-                    cert = x509.load_der_x509_certificate(entry.cert)
-                    metadata_list.append(_extract_cert_metadata(cert, alias=alias))
-            logger.info("Certificate metadata extracted successfully")
-            return metadata_list
-        except Exception:
-            raise ValueError("ERROR: Unable to extract metadata from JKS certificate, check if the password is correct and if the file is a valid JKS keystore")
+        except jks.util.BadKeystoreFormatException:
+            raise ValueError("ERROR: Not a valid JKS keystore file")
+        except jks.util.DecryptionFailureException:
+            raise ValueError("ERROR: Wrong password for JKS keystore")
+        except jks.util.UnsupportedKeystoreVersionException:
+            raise ValueError("ERROR: Unsupported JKS keystore version")
+        metadata_list = []
+        for alias, entry in ks.entries.items():
+            if isinstance(entry, jks.TrustedCertEntry):
+                # jks gives raw DER bytes, parse into a cryptography cert object
+                cert = x509.load_der_x509_certificate(entry.cert)
+                metadata_list.append(_extract_cert_metadata(cert, alias=alias))
+        logger.info("Certificate metadata extracted successfully")
+        return metadata_list
 
     return None
 
