@@ -36,14 +36,21 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
 
     # Try PKCS12
     # We attempt with an empty password first. If it succeeds, no password is needed.
-    # If it raises ValueError, it could be password-protected PKCS12 or not PKCS12 at all.
-    # Since PEM and DER were already tried above, a ValueError here on data starting with
-    # ASN.1 SEQUENCE (0x30) most likely means password-protected PKCS12.
+    # If a password was provided, we also try that — this gives a definitive answer
+    # instead of falling back to the 0x30 heuristic below.
     try:
         _key, _cert, _ca_certs = pkcs12.load_key_and_certificates(data, b"")
         logger.info("Certificate format: PKCS12 (password not required to extract metadata)")
         return "PKCS12"
     except ValueError:
+        # Empty password failed — try the user-provided password if available
+        if optional_password is not None:
+            try:
+                pkcs12.load_key_and_certificates(data, optional_password.encode())
+                logger.info("Certificate format: PKCS12 (verified with provided password)")
+                return "PKCS12"
+            except Exception:
+                pass
         # PEM/DER already failed above. If the data starts with an ASN.1 SEQUENCE tag,
         # it's very likely a password-protected PKCS12 (DER certs would have matched earlier).
         if len(data) > 0 and data[0] == 0x30:
@@ -102,11 +109,17 @@ def _extract_cert_metadata(cert, alias: str = None) -> dict:
 # cert_metadata_extract looks for common metadata (CN, SANs, Issuer, Validity Period, Serial Number).
 # for PKCS12 and JKS you need a password to deserialize. The `cryptography` library's PKCS12 loader returns the key, the leaf cert, and any additional CA certs separately.
 def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = None) -> dict | list[dict]:
-    if cert_type in ("PEM", "DER"):
-        if cert_type == "PEM":
-            cert = x509.load_pem_x509_certificate(data)
-        else:
-            cert = x509.load_der_x509_certificate(data)
+    if cert_type == "PEM":
+        # load_pem_x509_certificates (plural) handles PEM files with multiple
+        # certs concatenated (e.g. leaf + intermediate + root chain)
+        certs = x509.load_pem_x509_certificates(data)
+        logger.info("Certificate metadata extracted successfully (%d cert(s))", len(certs))
+        if len(certs) == 1:
+            return _extract_cert_metadata(certs[0])
+        return [_extract_cert_metadata(cert) for cert in certs]
+
+    if cert_type == "DER":
+        cert = x509.load_der_x509_certificate(data)
         logger.info("Certificate metadata extracted successfully")
         return _extract_cert_metadata(cert)
 

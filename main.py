@@ -155,7 +155,8 @@ def cmd_validate(args):
 def cmd_analyse(args):
     with open(args.cert, "rb") as f:
         data = f.read()
-    password = args.password if args.password else None
+    # argparse defaults to None when --password is not provided, no need to check
+    password = args.password
     detected_type = cert_format(data, args.cert, password)
     if detected_type is None:
         print("ERROR: Unable to detect certificate format")
