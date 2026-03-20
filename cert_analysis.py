@@ -1,7 +1,11 @@
+import logging
+
 from cryptography import x509
 from cryptography.x509.extensions import ExtensionNotFound
 from cryptography.hazmat.primitives.serialization import pkcs12
 import jks
+
+logger = logging.getLogger(__name__)
 
 # cert_format takes raw cert bytes and identifies which type of TLS cert it is.
 # Also verifies if path contains multiple certificates concatenated in a single file (certificate chain)
@@ -17,7 +21,7 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
     # Try PEM
     try:
         x509.load_pem_x509_certificate(data)
-        print("Certificate format: PEM")
+        logger.info("Certificate format: PEM")
         return "PEM"
     except Exception:  # broad catch: we're probing format, not handling a known error
         pass
@@ -25,7 +29,7 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
     # Try DER
     try:
         x509.load_der_x509_certificate(data)
-        print("Certificate format: DER")
+        logger.info("Certificate format: DER")
         return "DER"
     except Exception:
         pass
@@ -37,13 +41,13 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
     # ASN.1 SEQUENCE (0x30) most likely means password-protected PKCS12.
     try:
         _key, _cert, _ca_certs = pkcs12.load_key_and_certificates(data, b"")
-        print("Certificate format: PKCS12 (password not required to extract metadata)")
+        logger.info("Certificate format: PKCS12 (password not required to extract metadata)")
         return "PKCS12"
     except ValueError:
         # PEM/DER already failed above. If the data starts with an ASN.1 SEQUENCE tag,
         # it's very likely a password-protected PKCS12 (DER certs would have matched earlier).
         if len(data) > 0 and data[0] == 0x30:
-            print("Certificate format: PKCS12 (password required to extract metadata)")
+            logger.info("Certificate format: PKCS12 (password required to extract metadata)")
             return "PKCS12"
     except Exception:
         pass
@@ -53,14 +57,14 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
     if path.endswith(".jks"):
         try:
             pkcs12.load_key_and_certificates(data, b"")
-            print("Certificate format: JKS (PKCS12 underneath)")
+            logger.info("Certificate format: JKS (PKCS12 underneath)")
             return "JKS"
         except Exception:
             # Now try to load it as a JKS with the 'jks' library.
             if optional_password is not None:
                 try:
                     jks.KeyStore.loads(data, optional_password)
-                    print("Certificate format: JKS")
+                    logger.info("Certificate format: JKS")
                     return "JKS"
                 except Exception:
                     pass
@@ -103,20 +107,23 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
             cert = x509.load_pem_x509_certificate(data)
         else:
             cert = x509.load_der_x509_certificate(data)
-        print("Certificate metadata extracted successfully")
+        logger.info("Certificate metadata extracted successfully")
         return _extract_cert_metadata(cert)
 
     if cert_type == "PKCS12":
-        _key, cert, additional_certs = pkcs12.load_key_and_certificates(
-            data, optional_password.encode() if optional_password is not None else None
-        )
+        try:
+            _key, cert, additional_certs = pkcs12.load_key_and_certificates(
+                data, optional_password.encode() if optional_password is not None else None
+            )
+        except ValueError:
+            raise ValueError("ERROR: Unable to decrypt PKCS12 file, try providing a password with --password")
         if cert is None:
             raise ValueError("ERROR: Unable to extract metadata from PKCS12 certificate, check if the password is correct and if the file is a valid PKCS12 keystore")
         metadata_list = [_extract_cert_metadata(cert)]
         if additional_certs:
             for ca_cert in additional_certs:
                 metadata_list.append(_extract_cert_metadata(ca_cert))
-        print("Certificate metadata extracted successfully")
+        logger.info("Certificate metadata extracted successfully")
         return metadata_list
 
     if cert_type == "JKS":
@@ -130,7 +137,7 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
                     # jks gives raw DER bytes, parse into a cryptography cert object
                     cert = x509.load_der_x509_certificate(entry.cert)
                     metadata_list.append(_extract_cert_metadata(cert, alias=alias))
-            print("Certificate metadata extracted successfully")
+            logger.info("Certificate metadata extracted successfully")
             return metadata_list
         except Exception:
             raise ValueError("ERROR: Unable to extract metadata from JKS certificate, check if the password is correct and if the file is a valid JKS keystore")
@@ -168,5 +175,5 @@ def eku_inspect(metadata: dict | list[dict]) -> bool:
         # Check results AFTER looping through all certs
     is_mtls_candidate = has_server_auth and has_client_auth
 
-    print(f"EKU inspection results: Server Auth={has_server_auth}, Client Auth={has_client_auth}")
+    logger.info("EKU inspection results: Server Auth=%s, Client Auth=%s", has_server_auth, has_client_auth)
     return is_mtls_candidate

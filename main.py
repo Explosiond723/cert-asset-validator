@@ -1,6 +1,9 @@
 import argparse
+import logging
 import yaml
 from cert_analysis import cert_format, cert_metadata_extract, eku_inspect
+
+logger = logging.getLogger(__name__)
 
 
 def load_config(path: str) -> dict:
@@ -158,7 +161,18 @@ def cmd_analyse(args):
         print("ERROR: Unable to detect certificate format")
         return
     metadata = cert_metadata_extract(data, detected_type, password)
-    eku_inspect(metadata)
+
+    # normalize to list so we handle both single cert and multi-cert the same way
+    if isinstance(metadata, dict):
+        metadata = [metadata]
+
+    for cert_meta in metadata:
+        for key, value in cert_meta.items():
+            print(f"  {key}: {value}")
+        print("----")
+
+    is_mtls = eku_inspect(metadata)
+    print(f"mTLS candidate: {is_mtls}")
 
 
 if __name__ == "__main__":
@@ -172,7 +186,18 @@ if __name__ == "__main__":
     analyse_parser.add_argument("cert", help="Path to certificate file")
     analyse_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
 
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable verbose output (show INFO-level log messages)",
+    )
+
     args = parser.parse_args()
+
+    logging.basicConfig(
+        format="%(levelname)s: %(message)s",
+        level=logging.INFO if args.verbose else logging.WARNING,
+    )
+
     if args.command is None:
         parser.print_help()
     elif args.command == "validate":
