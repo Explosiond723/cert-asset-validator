@@ -217,12 +217,12 @@ if __name__ == "__main__":
     elif args.command == "validate":
         try:
             cmd_validate(args)
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             print(f"error: {e}")
             sys.exit(1)
     elif args.command == "analyse":
         try:
             cmd_analyse(args)
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             print(f"error: {e}")
             sys.exit(1)
