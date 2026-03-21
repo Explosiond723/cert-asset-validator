@@ -2,6 +2,8 @@ import logging
 
 from cryptography import x509
 from cryptography.x509.extensions import ExtensionNotFound
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.primitives.serialization import pkcs12
 import jks
 
@@ -198,3 +200,74 @@ def eku_inspect(metadata: dict | list[dict]) -> bool:
 
     logger.info("EKU inspection results: Server Auth=%s, Client Auth=%s", has_server_auth, has_client_auth)
     return is_mtls_candidate
+
+
+# csr_generate builds a Certificate Signing Request from an existing certificate.
+# It extracts the subject (CN, OU, O, C, etc.), SANs, and all relevant extensions
+# (EKU, Key Usage, etc.) from the cert, generates a new key pair matching the original
+# key type (RSA or EC), and signs the CSR.
+# Returns a tuple of (csr_pem_bytes, key_pem_bytes).
+def csr_generate(cert_data: bytes, cert_type: str, optional_password: str = None) -> tuple[bytes, bytes]:
+    # Load the first/leaf certificate depending on format
+    if cert_type == "PEM":
+        cert = x509.load_pem_x509_certificates(cert_data)[0]
+    elif cert_type == "DER":
+        cert = x509.load_der_x509_certificate(cert_data)
+    elif cert_type == "PKCS12":
+        try:
+            _key, cert, _ca_certs = pkcs12.load_key_and_certificates(
+                cert_data, optional_password.encode() if optional_password else None
+            )
+        except ValueError:
+            raise ValueError("unable to decrypt PKCS12 file, try providing a password with --password")
+        if cert is None:
+            raise ValueError("no certificate found in PKCS12 file")
+    else:
+        raise ValueError(f"CSR generation is not supported for {cert_type} format")
+
+    # Detect original key type and size to generate a matching key
+    pub_key = cert.public_key()
+    if isinstance(pub_key, rsa.RSAPublicKey):
+        key_size = pub_key.key_size
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+        logger.info("Generated new RSA-%d key", key_size)
+    elif isinstance(pub_key, ec.EllipticCurvePublicKey):
+        curve = pub_key.curve
+        private_key = ec.generate_private_key(curve)
+        logger.info("Generated new EC key (curve: %s)", curve.name)
+    else:
+        raise ValueError(f"unsupported key type: {type(pub_key).__name__}")
+
+    # Build the CSR with the same subject as the original cert.
+    # subject_name() copies the full subject including CN, OU, O, C, ST, L, etc.
+    builder = x509.CertificateSigningRequestBuilder()
+    builder = builder.subject_name(cert.subject)
+
+    # Copy all extensions from the original cert into the CSR.
+    # This preserves SANs, EKU (serverAuth/clientAuth for mTLS), Key Usage,
+    # Basic Constraints, and any other extensions the CA included.
+    # We skip Authority-related extensions (AKI, CRL, AIA, SKI) since those are
+    # set by the CA when it signs, not by the CSR requestor.
+    ca_only_extensions = (
+        x509.AuthorityKeyIdentifier,
+        x509.CRLDistributionPoints,
+        x509.AuthorityInformationAccess,
+        x509.SubjectKeyIdentifier,
+    )
+    for ext in cert.extensions:
+        if isinstance(ext.value, ca_only_extensions):
+            continue
+        builder = builder.add_extension(ext.value, critical=ext.critical)
+        logger.info("Copied extension: %s (critical=%s)", ext.oid._name, ext.critical)
+
+    csr = builder.sign(private_key, hashes.SHA256())
+
+    csr_pem = csr.public_bytes(serialization.Encoding.PEM)
+    key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    logger.info("CSR generated successfully")
+    return csr_pem, key_pem

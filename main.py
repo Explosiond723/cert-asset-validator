@@ -2,7 +2,7 @@ import argparse
 import logging
 import sys
 import yaml
-from cert_analysis import cert_format, cert_metadata_extract, eku_inspect
+from cert_analysis import cert_format, cert_metadata_extract, eku_inspect, csr_generate
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +177,31 @@ def cmd_analyse(args):
     print(f"mTLS candidate: {is_mtls}")
 
 
+def cmd_csr(args):
+    with open(args.cert, "rb") as f:
+        data = f.read()
+    password = args.password
+    detected_type = cert_format(data, args.cert, password)
+    if detected_type is None:
+        print("error: unable to detect certificate format")
+        sys.exit(1)
+
+    csr_pem, key_pem = csr_generate(data, detected_type, password)
+
+    # Default output filenames based on the input cert name
+    cert_base = args.cert.rsplit(".", 1)[0]
+    csr_path = args.output or f"{cert_base}.csr"
+    key_path = args.key_output or f"{cert_base}-key.pem"
+
+    with open(csr_path, "wb") as f:
+        f.write(csr_pem)
+    with open(key_path, "wb") as f:
+        f.write(key_pem)
+
+    print(f"CSR written to: {csr_path}")
+    print(f"Private key written to: {key_path}")
+
+
 if __name__ == "__main__":
     # Main parser — this is the root command: `python main.py`
     parser = argparse.ArgumentParser(description="cert-asset-validator")
@@ -195,6 +220,14 @@ if __name__ == "__main__":
     analyse_parser = subparsers.add_parser("analyse", help="Analyse a certificate file")
     analyse_parser.add_argument("cert", help="Path to certificate file")
     analyse_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
+
+    # `python main.py csr <cert> [--password] [--output] [--key-output]`
+    # Generates a CSR from an existing certificate, reusing its subject, SANs, and extensions
+    csr_parser = subparsers.add_parser("csr", help="Generate a CSR from an existing certificate")
+    csr_parser.add_argument("cert", help="Path to certificate file")
+    csr_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
+    csr_parser.add_argument("--output", help="Output path for the CSR file (default: <cert>.csr)")
+    csr_parser.add_argument("--key-output", help="Output path for the private key (default: <cert>-key.pem)")
 
     # Global flag (applies to all subcommands): -v / --verbose
     parser.add_argument(
@@ -223,6 +256,12 @@ if __name__ == "__main__":
     elif args.command == "analyse":
         try:
             cmd_analyse(args)
+        except (ValueError, OSError) as e:
+            print(f"error: {e}")
+            sys.exit(1)
+    elif args.command == "csr":
+        try:
+            cmd_csr(args)
         except (ValueError, OSError) as e:
             print(f"error: {e}")
             sys.exit(1)
