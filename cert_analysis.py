@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 #   - JKS
 def cert_format(data: bytes, path: str = "", optional_password: str = None) -> str:
     if data is None or len(data) == 0:
-        raise ValueError("ERROR: certificate file is empty")
+        raise ValueError("certificate file is empty")
 
     # Try PEM
     try:
@@ -131,11 +131,11 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
                 data, optional_password.encode() if optional_password is not None else None
             )
         except ValueError:
-            raise ValueError("ERROR: Unable to decrypt PKCS12 file, try providing a password with --password")
+            raise ValueError("unable to decrypt PKCS12 file, try providing a password with --password")
         except Exception as e:
-            raise ValueError(f"ERROR: Failed to load PKCS12 file: {e}")
+            raise ValueError(f"failed to load PKCS12 file: {e}")
         if cert is None:
-            raise ValueError("ERROR: Unable to extract metadata from PKCS12 certificate, check if the password is correct and if the file is a valid PKCS12 keystore")
+            raise ValueError("unable to extract metadata from PKCS12 certificate, check if the password is correct and if the file is a valid PKCS12 keystore")
         metadata_list = [_extract_cert_metadata(cert)]
         if additional_certs:
             for ca_cert in additional_certs:
@@ -145,15 +145,15 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
 
     if cert_type == "JKS":
         if optional_password is None:
-            raise ValueError("ERROR: JKS keystores require a password")
+            raise ValueError("JKS keystores require a password")
         try:
             ks = jks.KeyStore.loads(data, optional_password)
         except jks.util.BadKeystoreFormatException:
-            raise ValueError("ERROR: Not a valid JKS keystore file")
+            raise ValueError("not a valid JKS keystore file")
         except jks.util.DecryptionFailureException:
-            raise ValueError("ERROR: Wrong password for JKS keystore")
+            raise ValueError("wrong password for JKS keystore")
         except jks.util.UnsupportedKeystoreVersionException:
-            raise ValueError("ERROR: Unsupported JKS keystore version")
+            raise ValueError("unsupported JKS keystore version")
         metadata_list = []
         for alias, entry in ks.entries.items():
             if isinstance(entry, jks.TrustedCertEntry):
@@ -163,7 +163,7 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
         logger.info("Certificate metadata extracted successfully")
         return metadata_list
 
-    return None
+    raise ValueError(f"unsupported certificate type: {cert_type}")
 
 
 # eku_inspect inspects the TLS Certificate Extended Key Usage extension for Server Authentication and Client Authentication. If both are present the cert will most likely be mTLS.
