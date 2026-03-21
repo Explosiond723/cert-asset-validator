@@ -15,8 +15,11 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 ### YAML validation (`main.py`) — DONE
 
-- `load_assets(path)` / `validate_config(cfg)` — validates required fields based on `certType`
+- `load_config(path)` / `validate_config(cfg, cluster_names)` — validates required fields based on `certType`, validates cluster references
+- `validate_cluster(cluster)` — validates cluster definitions (name + context)
 - Argparse CLI with `validate` and `analyse` subcommands
+- Top-level error handling with `sys.exit(1)` for clean CLI output
+- Logging with `-v`/`--verbose` flag
 
 ### Test certificates — DONE
 
@@ -24,11 +27,11 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 ---
 
-## Step 1: Multi-cluster YAML schema
+## Step 1: Multi-cluster YAML schema — DONE
 
-Redesign the YAML config to support multiple clusters in a single file. This is the foundation everything else builds on.
+Redesigned the YAML config to support multiple clusters in a single file. Backwards compatible with legacy flat list format.
 
-### New schema
+### Schema
 
 ```yaml
 clusters:
@@ -74,13 +77,13 @@ assets:
         key: keystorePassword
 ```
 
-### Changes needed
+### What was implemented
 
-- Add `clusters` top-level key with `name` and `context` per cluster
-- Add `cluster` field to each asset (required), must reference a defined cluster name
-- Update `validate_config()` to validate the new schema
+- `clusters` top-level key with `name` and `context` per cluster
+- `cluster` field on each asset (required when clusters defined), must reference a defined cluster name
+- `validate_config()` and `validate_cluster()` validate the new schema
 - Backwards compatibility: if `clusters` is absent and no `cluster` field on assets, treat it as a single-cluster config (legacy mode)
-- Update `example-cfg.yaml` to use the new schema
+- `example-cfg.yaml` updated to use the new schema
 
 ---
 
@@ -95,7 +98,7 @@ The tool does NOT store credentials. It relies on the user's existing auth conte
 1. **Kubeconfig** (primary) — the user runs `oc login`, `gcloud container clusters get-credentials`, `aws eks update-kubeconfig`, etc. before using the tool. The `context` field in the YAML maps to a kubeconfig context.
 2. **In-cluster ServiceAccount** — when running inside a pod, the tool picks up the mounted token automatically. The user is responsible for creating the ServiceAccount and RBAC.
 
-### `cluster.py` module
+### `cluster.py` module (stubs created, not yet implemented)
 
 ```python
 connect(context=None)           # in-cluster first, then kubeconfig fallback
@@ -367,7 +370,7 @@ python main.py discover --live --namespace energia-prod --output assets.yaml
 
 These are smaller enhancements to the existing `cert_analysis.py` that add value at any point:
 
-- **PEM chain handling** — parse all certs in a concatenated PEM, not just the first
+- ~~**PEM chain handling**~~ — DONE: `cert_metadata_extract` uses `load_pem_x509_certificates` (plural) to handle concatenated PEM chains
 - **Expiration warnings** — days remaining, flag if expired or expiring within 30 days
 - **Self-signed detection** — Subject == Issuer check
 - **JKS magic-byte check** — `0xFEEDFEED` pre-filter before full parse

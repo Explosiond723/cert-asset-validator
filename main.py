@@ -161,7 +161,7 @@ def cmd_analyse(args):
     detected_type = cert_format(data, args.cert, password)
     if detected_type is None:
         print("error: unable to detect certificate format")
-        return
+        sys.exit(1)
     metadata = cert_metadata_extract(data, detected_type, password)
 
     # normalize to list so we handle both single cert and multi-cert the same way
