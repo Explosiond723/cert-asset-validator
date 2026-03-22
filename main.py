@@ -213,21 +213,26 @@ if __name__ == "__main__":
 
     # `python main.py validate <config>` — takes one positional argument (the YAML path)
     validate_parser = subparsers.add_parser("validate", help="Validate YAML asset definitions")
-    validate_parser.add_argument("config", help="Path to YAML config file")
+    validate_parser.add_argument("config", metavar="CONFIGFILE", help="Path to YAML config file")
+    validate_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
 
     # `python main.py analyse <cert> [--password]` — takes the cert path as positional,
     # and an optional --password flag for PKCS12/JKS files that need one
     analyse_parser = subparsers.add_parser("analyse", help="Analyse a certificate file")
-    analyse_parser.add_argument("cert", help="Path to certificate file")
+    analyse_parser.add_argument("cert", metavar="FILE", help="Path to certificate file")
     analyse_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
+    analyse_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
+
 
     # `python main.py csr <cert> [--password] [--output] [--key-output]`
     # Generates a CSR from an existing certificate, reusing its subject, SANs, and extensions
     csr_parser = subparsers.add_parser("csr", help="Generate a CSR from an existing certificate")
-    csr_parser.add_argument("cert", help="Path to certificate file")
+    csr_parser.add_argument("cert", metavar="FILE", help="Path to certificate file")
     csr_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
     csr_parser.add_argument("--output", help="Output path for the CSR file (default: <cert>.csr)")
     csr_parser.add_argument("--key-output", help="Output path for the private key (default: <cert>-key.pem)")
+    csr_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
+
 
     # Global flag (applies to all subcommands): -v / --verbose
     parser.add_argument(
