@@ -17,6 +17,10 @@ In real-world Kubernetes/OpenShift environments, certificates are often:
 
 ```bash
 # Install dependencies (Python 3.10+)
+# On Fedora/RHEL, python3-devel is needed to build the twofish C extension (pyjks dependency):
+#   sudo dnf install python3-devel
+# On Debian/Ubuntu:
+#   sudo apt install python3-dev
 pip install -r requirements.txt
 
 # Validate a YAML asset definition
@@ -27,6 +31,9 @@ python main.py analyse path/to/cert.pem
 
 # Analyse a password-protected PKCS12/JKS keystore
 python main.py analyse path/to/keystore.p12 --password mysecret
+
+# Generate a CSR from an existing certificate
+python main.py csr path/to/cert.pem
 ```
 
 Running `python main.py` with no arguments prints usage help.
@@ -37,13 +44,13 @@ Running `python main.py` with no arguments prints usage help.
 
 - **YAML validation** (`validate`) — parses single or multiple certificate asset definitions, validates required fields and structure based on `certType`, fails fast with human-readable errors
 - **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates
+- **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
+- **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate, preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions; generates a new key pair matching the original key type and size
 
 ### Planned
 
-- **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
 - **Search & query** — find assets by CN, secret name, namespace, or cluster
 - **Cross-reference map** — show where the same cert lives across locations, CA inventory, keystore+truststore relationship analysis
-- **CSR generation** — generate CSRs from existing cert metadata with interactive overrides, reuse keys for mTLS
 - **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
 - **Auto-discovery** — scan clusters and generate YAML inventory from existing Secrets
 

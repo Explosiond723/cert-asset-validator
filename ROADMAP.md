@@ -236,49 +236,45 @@ python main.py map assets.yaml --live --cn "energia-api.example.com"
 
 ---
 
-## Step 5: CSR generation
+## Step 5: CSR generation — PARTIAL
 
 Generate a Certificate Signing Request for one or more assets, reusing the existing cert's subject, SANs, and key type as defaults.
 
-### CSR generation flow
+### What's implemented
 
-1. User identifies the asset(s) — by id, CN, or search results
-2. Tool fetches the current cert (from cluster via `--live`, or from a local file)
-3. Extracts subject, SANs, key algorithm/size from the existing cert
-4. Prompts the user for overrides (empty = keep default):
+- `csr_generate(cert_data, cert_type, optional_password)` in `cert_analysis.py` — reads a cert (PEM, DER, PKCS12), generates a new key pair matching the original type/size, builds a CSR preserving the full subject and all extensions (SANs, EKU, Key Usage, etc.), skips CA-only extensions (AKI, CRL, AIA, SKI)
+- `csr` subcommand in `main.py` — `python main.py csr <cert> [--password] [--output] [--key-output]`
+- Supports RSA and EC key types
 
-   ```text
-   Subject [CN=energia-api.example.com, O=MyOrg]:
-   SANs [energia-api.example.com, api.example.com]:
-   Key algorithm [RSA 2048]:
-   ```
+### Still to do
 
-5. For mTLS certs: reuse the existing private key if the user confirms (some mTLS setups require key continuity)
-6. Generates the CSR and writes to a file
+- Interactive subject overrides (change CN, OU, etc. before generating)
+- `--live` mode: fetch cert from cluster via asset id
+- Reuse existing private key for mTLS key continuity
+- JKS support
 
-### CSR CLI
+### CSR CLI (current)
+
+```bash
+# Generate CSR from a local cert file
+python main.py csr test_certs/full.pem
+
+# Custom output paths
+python main.py csr test_certs/full.pem --output my.csr --key-output my-key.pem
+
+# PKCS12 with password
+python main.py csr keystore.p12 --password mysecret
+```
+
+### CSR CLI (planned, requires cluster connectivity)
 
 ```bash
 # Generate CSR for a specific asset
 python main.py csr assets.yaml --id energia-api --live
 
-# Generate CSR from a local cert file
-python main.py csr --cert test_certs/full.pem
-
 # Non-interactive (accept all defaults)
 python main.py csr assets.yaml --id energia-api --live --defaults
-
-# Output to specific file
-python main.py csr assets.yaml --id energia-api --live --output energia-api.csr
 ```
-
-### CSR implementation
-
-Use `cryptography` library:
-
-- `rsa.generate_private_key()` or `ec.generate_private_key()` to create a new key (or load existing for mTLS)
-- `x509.CertificateSigningRequestBuilder` to build the CSR
-- Serialize to PEM format
 
 ---
 
