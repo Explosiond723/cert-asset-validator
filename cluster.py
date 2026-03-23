@@ -1,4 +1,6 @@
-from kubernetes import config
+import base64
+
+from kubernetes import config, client
 
  
 
@@ -38,17 +40,25 @@ def connect(config_file: str = None, context: str = None) -> None:
                 raise RuntimeError(f"Failed to load kubeconfig: {e2}")
 
 
-# get_secret retrieves a single data key from a Kubernetes Secret.
+# get_secret_key retrieves a single data key from a Kubernetes Secret.
 # The secret.data values in Kubernetes are base64-encoded strings; this function
 # decodes them and returns the raw bytes, ready to be passed to cert_analysis
 # functions (cert_format, cert_metadata_extract) which expect raw bytes.
 # Raises an error if the Secret or key does not exist, or if the ServiceAccount
 # lacks get permissions on secrets in the target namespace.
-def get_secret(namespace: str, name: str, key: str) -> bytes:
-    pass
+def get_secret_key(namespace: str, name: str, key: str) -> bytes:
+
+    secret = client.CoreV1Api().read_namespaced_secret(name=name, namespace=namespace)
+    if key not in secret.data:
+        raise KeyError(f"Secret '{name}' does not contain key '{key}'")
+    
+    return base64.b64decode(secret.data[key])
 
 
 # list_tls_secrets lists all Secrets in a namespace that contain TLS-related keys.
+# They might not be of type kubernetes.io/tls, but if they have keys that look like certs/keys, we include them as well.
+# This is default behavior. if we want to only include kubernetes.io/tls secrets, we can add a filter for that.
+# 
 # Used by the discover command to auto-generate YAML asset definitions from cluster state.
 # Filters for:
 #   - Type kubernetes.io/tls (contains tls.crt and tls.key)
@@ -57,4 +67,32 @@ def get_secret(namespace: str, name: str, key: str) -> bytes:
 # Returns a list of dicts with secret name, type, and matching key names.
 # Skips Secrets the ServiceAccount cannot access (permission errors logged as warnings).
 def list_tls_secrets(namespace: str) -> list[dict]:
-    pass
+
+    client_api = client.CoreV1Api()
+    try:
+        secrets = client_api.list_namespaced_secret(namespace=namespace)
+    except client.exceptions.ApiException as e:
+        print(f"Error: Failed to list secrets in namespace '{namespace}': {e}")
+        return []
+
+    tls_secrets = []
+
+    for secret in secrets.items:
+        if secret.type == "kubernetes.io/tls":
+            if "tls.crt" in secret.data and "tls.key" in secret.data:
+                tls_secrets.append({
+                    "name": secret.metadata.name,
+                    "type": secret.type,
+                    "keys": ["tls.crt", "tls.key"]
+                })
+        elif secret.type == "Opaque":
+            # non-standard secret, check for keys that look like certs/keys
+            matching_keys = [key for key in secret.data.keys() if key.lower().endswith(('.pem', '.crt', '.der', '.p12', '.pfx', '.jks')) or key.lower().startswith(('keystore', 'truststore'))]
+            if matching_keys:
+                tls_secrets.append({
+                    "name": secret.metadata.name,
+                    "type": secret.type,
+                    "keys": matching_keys
+                })
+        
+    return tls_secrets
