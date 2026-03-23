@@ -17,7 +17,7 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 - `load_config(path)` / `validate_config(cfg, cluster_names)` — validates required fields based on `certType`, validates cluster references
 - `validate_cluster(cluster)` — validates cluster definitions (name + context)
-- Argparse CLI with `validate` and `analyse` subcommands
+- Argparse CLI with `validate`, `analyse`, and `csr` subcommands
 - Top-level error handling with `sys.exit(1)` for clean CLI output
 - Logging with `-v`/`--verbose` flag
 
@@ -87,7 +87,7 @@ assets:
 
 ---
 
-## Step 2: Cluster connectivity
+## Step 2: Cluster connectivity — DONE
 
 Connect to live clusters and retrieve Secret data. Uses the `kubernetes` Python client, which works with vanilla k8s, OpenShift, GKE, EKS, and AKS through kubeconfig exec-based auth plugins.
 
@@ -98,12 +98,12 @@ The tool does NOT store credentials. It relies on the user's existing auth conte
 1. **Kubeconfig** (primary) — the user runs `oc login`, `gcloud container clusters get-credentials`, `aws eks update-kubeconfig`, etc. before using the tool. The `context` field in the YAML maps to a kubeconfig context.
 2. **In-cluster ServiceAccount** — when running inside a pod, the tool picks up the mounted token automatically. The user is responsible for creating the ServiceAccount and RBAC.
 
-### `cluster.py` module (stubs created, not yet implemented)
+### `cluster.py` module
 
 ```python
-connect(context=None)           # in-cluster first, then kubeconfig fallback
-get_secret(namespace, name, key) -> bytes  # base64-decoded secret data
-list_tls_secrets(namespace) -> list        # secrets with cert-like keys
+connect(config_file=None, context=None)  # if config_file given, use it; otherwise in-cluster first, then kubeconfig fallback
+get_secret_key(namespace, name, key) -> bytes  # base64-decoded single key from a Secret
+list_tls_secrets(namespace) -> list[dict]      # secrets with cert-like keys (kubernetes.io/tls + Opaque with *.pem, *.crt, etc.)
 ```
 
 ### RBAC
@@ -123,11 +123,11 @@ rules:
 
 The tool should detect permission errors and emit clear warnings per-namespace without blocking the entire run.
 
-### CLI flags
+### CLI flags (not yet wired into argparse)
 
 - `--live` — opt-in to cluster connection (default is offline validation only)
-- `--context` — override the kubeconfig context for all clusters
-- `--kubeconfig` — path to a non-default kubeconfig file
+- `--context` — override the kubeconfig context for all clusters (maps to `connect(context=...)`)
+- `--kubeconfig` — path to a non-default kubeconfig file (maps to `connect(config_file=...)`)
 
 ### Security
 
@@ -376,9 +376,9 @@ These are smaller enhancements to the existing `cert_analysis.py` that add value
 
 ## Implementation order
 
-1. **Step 1 (multi-cluster schema)** — foundation for everything; update validation + example config
-2. **Step 2 (cluster connectivity)** — enables all live features; start with kubeconfig, test with kind
-3. **Step 3 (search/query)** — quick win once schema + connectivity exist; makes the tool immediately useful for operators
+1. **Step 1 (multi-cluster schema)** — DONE
+2. **Step 2 (cluster connectivity)** — DONE (not yet wired into CLI via `--live` flag)
+3. **Step 3 (search/query)** — next up; quick win once schema + connectivity exist; makes the tool immediately useful for operators
 4. **Step 4 (cross-reference map)** — the high-value feature; depends on connectivity
 5. **Step 5 (CSR generation)** — depends on cert metadata extraction (already done) + connectivity
 6. **Step 6 (cert rotation)** — depends on cross-reference map + connectivity; the most operationally impactful feature

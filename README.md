@@ -46,6 +46,7 @@ Running `python main.py` with no arguments prints usage help.
 - **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates
 - **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
 - **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate, preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions; generates a new key pair matching the original key type and size
+- **Cluster connectivity** — connects to Kubernetes/OpenShift clusters via kubeconfig or in-cluster ServiceAccount, retrieves secrets, and discovers TLS-related secrets in a namespace. Works with any provider (OpenShift, GKE, EKS, AKS).
 
 ### Planned
 
@@ -53,6 +54,7 @@ Running `python main.py` with no arguments prints usage help.
 - **Cross-reference map** — show where the same cert lives across locations, CA inventory, keystore+truststore relationship analysis
 - **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
 - **Auto-discovery** — scan clusters and generate YAML inventory from existing Secrets
+- **`--live` mode** — opt-in flag to connect to clusters for real-time cert analysis, search, and rotation
 
 See `ROADMAP.md` for the detailed implementation plan.
 
