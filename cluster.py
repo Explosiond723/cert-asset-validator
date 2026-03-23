@@ -1,11 +1,41 @@
+from kubernetes import config
+
+ 
+
 # connect establishes a connection to a Kubernetes/OpenShift cluster.
-# It tries in-cluster config first (checks for the ServiceAccount token at
-# /var/run/secrets/kubernetes.io/serviceaccount/token), then falls back to
-# kubeconfig (~/.kube/config). A specific kubeconfig context can be provided
-# to target a particular cluster entry.
-# Raises an error if neither in-cluster config nor kubeconfig is available.
-def connect(context: str = None) -> None:
-    pass
+# It configures the kubernetes client globally — after calling connect(),
+# all API calls (get_secret, list_tls_secrets) use the loaded config
+# automatically. Nothing is returned; it just sets up the session.
+#
+# If config_file is provided, it loads that specific kubeconfig file.
+# Otherwise it tries in-cluster config first (checks for the ServiceAccount
+# token at /var/run/secrets/kubernetes.io/serviceaccount/token), then falls
+# back to kubeconfig (~/.kube/config).
+#
+# Works with any provider (OpenShift, GKE, EKS, AKS, vanilla k8s) because
+# they all write their auth config into ~/.kube/config when the user logs in
+# (oc login, gcloud, aws eks, etc.). The kubernetes library reads those
+# auth plugins transparently.
+#
+# Raises RuntimeError if no valid config is found.
+def connect(config_file: str = None, context: str = None) -> None:
+
+    if config_file:
+        try:
+            # try to load the specified kubeconfig file and context (if provided)
+            config.load_kube_config(config_file=config_file, context=context)
+        except config.ConfigException as e:
+            raise RuntimeError(f"Failed to load kubeconfig: {e}")
+    else:
+        try:
+            # first try in-cluster config (works if running inside a Pod with a ServiceAccount)
+            config.load_incluster_config()
+        except config.ConfigException as e:
+            try:
+                # if in-cluster config fails, try kubeconfig as fallback (works for local dev)
+                config.load_kube_config(context=context)
+            except config.ConfigException as e2:
+                raise RuntimeError(f"Failed to load kubeconfig: {e2}")
 
 
 # get_secret retrieves a single data key from a Kubernetes Secret.
