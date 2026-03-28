@@ -3,6 +3,7 @@ import logging
 import sys
 import yaml
 from cert_analysis import cert_format, cert_metadata_extract, eku_inspect, csr_generate
+from cluster import connect, get_secret_key, get_tls_password, list_tls_passwords, list_tls_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +76,16 @@ def validate_config(cfg: dict, cluster_names: list[str]) -> None:
         raise ValueError("config file not found or not in the correct format")
 
     # top-level required
-    for k in ("id", "namespace", "certType"):
+    for k in ("id", "namespace", "cn", "certType"):
         if k not in cfg:
             raise ValueError(f"missing required field: {k}")
+        
+    if not isinstance(cfg["cn"], str):
+        raise ValueError("field 'cn' must be a string")
+    if not isinstance(cfg["namespace"], str):
+        raise ValueError("field 'namespace' must be a string")
+    if not isinstance(cfg["certType"], str):
+        raise ValueError("field 'certType' must be a string")
 
     # cluster field: required when clusters are defined, must reference a valid name
     if cluster_names:
@@ -148,6 +156,7 @@ def cmd_validate(args):
         if "cluster" in cfg:
             print("Cluster:  ", cfg["cluster"])
         print("Namespace:", cfg["namespace"])
+        print("CN:      ", cfg["cn"])
         print("certType: ", cfg["certType"])
         print("mTLS:     ", cfg.get("mtls", False))
         print("----")
@@ -201,6 +210,39 @@ def cmd_csr(args):
     print(f"CSR written to: {csr_path}")
     print(f"Private key written to: {key_path}")
 
+# cmd_search is a simple filter that loads the YAML config and prints assets that match the provided filters.
+# This is useful for quickly finding assets in a large inventory without needing to use `kubectl` or query the cluster directly.
+def cmd_search(args):
+    cfg = load_config(args.config)
+    clusters = cfg["clusters"]
+    assets = cfg["assets"]
+    cluster_names = [c["name"] for c in clusters]
+    for i, asset in enumerate(assets):
+        try:
+            validate_config(asset, cluster_names)
+        except ValueError as ve:
+            asset_id = asset.get("id", f"asset[{i}]")
+            raise ValueError(f"{asset_id}: {ve}")
+    
+    if args.namespace:
+        assets = [a for a in assets if a["namespace"] == args.namespace]
+    if args.cluster:
+        assets = [a for a in assets if a.get("cluster") == args.cluster]
+    if args.secret:
+        assets = [a for a in assets if a.get("keystore", {}).get("secret", {}).get("name") == args.secret or a.get("truststore", {}).get("secret", {}).get("name") == args.secret]
+    if args.cn:
+        assets = [a for a in assets if args.cn in a["cn"]]
+    
+    print(f"Found {len(assets)} matching assets:")
+    print("----")
+
+    for asset in assets:
+        print(f"  {asset['id']}  |  {asset.get('cluster', 'N/A')}  |  {asset['namespace']}  |  {asset['cn']}  |  {asset['certType']}")
+        print("----")
+    
+    return assets
+    
+
 
 if __name__ == "__main__":
     # Main parser — this is the root command: `python main.py`
@@ -233,7 +275,17 @@ if __name__ == "__main__":
     csr_parser.add_argument("--key-output", help="Output path for the private key (default: <cert>-key.pem)")
     csr_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
 
-
+    # `python main.py search <config> [--namespace] [--cluster] [--secret] [--cn]`
+    # Filters assets from the YAML inventory by namespace, cluster, secret name, or CN.
+    # Multiple filters can be combined (AND logic). Prints matching assets.
+    search_parser = subparsers.add_parser("search", help="Search the YAML asset inventory by namespace, cluster, secret, or CN")
+    search_parser.add_argument("config", metavar="CONFIGFILE", help="Path to YAML config file")
+    search_parser.add_argument("--namespace", help="Filter assets by namespace")
+    search_parser.add_argument("--cluster", help="Filter assets by cluster name")
+    search_parser.add_argument("--secret", help="Filter assets by secret name")
+    search_parser.add_argument("--cn", help="Filter assets by Common Name (substring match)")
+    search_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
+    
     # Global flag (applies to all subcommands): -v / --verbose
     parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -270,3 +322,13 @@ if __name__ == "__main__":
         except (ValueError, OSError) as e:
             print(f"error: {e}")
             sys.exit(1)
+    elif args.command == "search":
+        try:
+            cmd_search(args)
+        except (ValueError, OSError) as e:
+            print(f"error: {e}")
+            sys.exit(1)
+    else:
+        print(f"Unknown command: {args.command}")
+        parser.print_help()
+        sys.exit(1)

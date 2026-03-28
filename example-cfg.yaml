@@ -16,6 +16,7 @@ assets:
   - id: energia-api
     cluster: prod-ocp
     namespace: energia-prod
+    cn: energia-api.example.com
 
     # certType defines how the certificate material must be handled.
     # If certType requires a password (e.g. keystore, pkcs12),
@@ -57,6 +58,7 @@ assets:
   - id: billing-api
     cluster: staging-gke
     namespace: billing-prod
+    cn: billing.internal.example.com
 
     # PKCS12 example without truststore
     certType: pkcs12
@@ -76,6 +78,7 @@ assets:
   - id: public-web
     cluster: prod-ocp
     namespace: web-prod
+    cn: www.example.com
 
     # PEM example — no password, no truststore
     certType: pem

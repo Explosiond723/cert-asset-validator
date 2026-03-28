@@ -54,6 +54,43 @@ def get_secret_key(namespace: str, name: str, key: str) -> bytes:
     
     return base64.b64decode(secret.data[key])
 
+# get_tls_password is a helper function to retrieve TLS passwords from Secrets.
+# It works the same as get_secret_key but is named specifically for TLS passwords
+# to make it clear in the code when we're retrieving a password vs a cert/key.
+def get_tls_password(namespace: str, name: str, key: str) -> bytes:
+    
+    secret = client.CoreV1Api().read_namespaced_secret(name=name, namespace=namespace)
+    if key not in secret.data:
+        raise KeyError(f"Secret '{name}' does not contain key '{key}'")
+    return base64.b64decode(secret.data[key])
+
+
+# list_tls_passwords lists all Secrets in a namespace that contain keys that look like passwords.
+# This is used by the discover command to find any TLS-related secrets that might contain passwords,
+# even if they don't follow the standard TLS secret format. It filters for Opaque secrets with keys
+# that start with or end with common password patterns (password, pass, pwd).
+def list_tls_passwords(namespace: str) -> list[dict]:
+
+    client_api = client.CoreV1Api()
+    try:
+        secrets = client_api.list_namespaced_secret(namespace=namespace)
+    except client.exceptions.ApiException as e:
+        print(f"Error: Failed to list secrets in namespace '{namespace}': {e}")
+        return []
+
+    tls_passwords = []
+
+    for secret in secrets.items:
+        if secret.type == "Opaque":
+            matching_keys = [key for key in secret.data.keys() if key.lower().endswith(('password', 'pass', 'pwd', 'truststorepassword', 'keystorepassword')) or key.lower().startswith(('password', 'pass', 'pwd', 'truststorepassword', 'keystorepassword'))]
+            if matching_keys:
+                tls_passwords.append({
+                    "name": secret.metadata.name,
+                    "type": secret.type,
+                    "keys": matching_keys
+                })
+        
+    return tls_passwords
 
 # list_tls_secrets lists all Secrets in a namespace that contain TLS-related keys.
 # They might not be of type kubernetes.io/tls, but if they have keys that look like certs/keys, we include them as well.
