@@ -17,7 +17,7 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 - `load_config(path)` / `validate_config(cfg, cluster_names)` — validates required fields based on `certType`, validates cluster references
 - `validate_cluster(cluster)` — validates cluster definitions (name + context)
-- Argparse CLI with `validate`, `analyse`, and `csr` subcommands
+- Argparse CLI with `validate`, `analyse`, `csr`, and `search` subcommands
 - Top-level error handling with `sys.exit(1)` for clean CLI output
 - Logging with `-v`/`--verbose` flag
 
@@ -103,7 +103,9 @@ The tool does NOT store credentials. It relies on the user's existing auth conte
 ```python
 connect(config_file=None, context=None)  # if config_file given, use it; otherwise in-cluster first, then kubeconfig fallback
 get_secret_key(namespace, name, key) -> bytes  # base64-decoded single key from a Secret
+get_tls_password(namespace, name, key) -> bytes  # same as get_secret_key, semantically for passwords
 list_tls_secrets(namespace) -> list[dict]      # secrets with cert-like keys (kubernetes.io/tls + Opaque with *.pem, *.crt, etc.)
+list_tls_passwords(namespace) -> list[dict]    # Opaque secrets with password-like keys
 ```
 
 ### RBAC
@@ -143,9 +145,9 @@ The tool should detect permission errors and emit clear warnings per-namespace w
 
 ---
 
-## Step 3: Search & query engine
+## Step 3: Search & query engine — DONE
 
-Allow users to search the asset inventory by CN, secret name, namespace, or cluster. This is useful before running analysis, CSR generation, or rotation — the user needs to find the right asset(s) first.
+Offline search of the asset inventory by CN, secret name, namespace, or cluster. Validates all assets before filtering.
 
 ### CLI
 
@@ -166,13 +168,16 @@ python main.py search assets.yaml --cluster prod-ocp
 python main.py search assets.yaml --namespace energia-prod --cn "api"
 ```
 
-### With `--live` flag
+### Search implementation
 
-When `--live` is set, the search also fetches the actual cert from the cluster and matches against the real CN/SANs (not just the YAML metadata). This is how the user validates that "the cert in the cluster matches what I expect."
+- `cmd_search(args)` in `main.py` — loads config, validates all assets, then filters by namespace, cluster, secret name (checks both keystore and truststore), and CN (substring match). Multiple filters combine with AND logic.
+- `cn` added as a required field in the asset schema to enable offline CN search
+- Compact one-line-per-asset output format: `id | cluster | namespace | cn | certType`
 
-### Search output
+### Search still to do
 
-Print matching assets with key metadata: id, cluster, namespace, certType, and (if `--live`) the actual CN, SANs, expiration.
+- `--live` mode: fetch actual cert from cluster and match against real CN/SANs (not just YAML metadata)
+- Show actual CN, SANs, expiration when `--live` is set
 
 ---
 
@@ -246,7 +251,7 @@ Generate a Certificate Signing Request for one or more assets, reusing the exist
 - `csr` subcommand in `main.py` — `python main.py csr <cert> [--password] [--output] [--key-output]`
 - Supports RSA and EC key types
 
-### Still to do
+### CSR still to do
 
 - Interactive subject overrides (change CN, OU, etc. before generating)
 - `--live` mode: fetch cert from cluster via asset id
@@ -378,7 +383,7 @@ These are smaller enhancements to the existing `cert_analysis.py` that add value
 
 1. **Step 1 (multi-cluster schema)** — DONE
 2. **Step 2 (cluster connectivity)** — DONE (not yet wired into CLI via `--live` flag)
-3. **Step 3 (search/query)** — next up; quick win once schema + connectivity exist; makes the tool immediately useful for operators
+3. **Step 3 (search/query)** — DONE (offline search; `--live` mode still to do)
 4. **Step 4 (cross-reference map)** — the high-value feature; depends on connectivity
 5. **Step 5 (CSR generation)** — depends on cert metadata extraction (already done) + connectivity
 6. **Step 6 (cert rotation)** — depends on cross-reference map + connectivity; the most operationally impactful feature

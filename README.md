@@ -34,6 +34,10 @@ python main.py analyse path/to/keystore.p12 --password mysecret
 
 # Generate a CSR from an existing certificate
 python main.py csr path/to/cert.pem
+
+# Search assets by CN, namespace, cluster, or secret name
+python main.py search example-cfg.yaml --cn "energia"
+python main.py search example-cfg.yaml --namespace energia-prod --cluster prod-ocp
 ```
 
 Running `python main.py` with no arguments prints usage help.
@@ -47,10 +51,10 @@ Running `python main.py` with no arguments prints usage help.
 - **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
 - **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate, preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions; generates a new key pair matching the original key type and size
 - **Cluster connectivity** — connects to Kubernetes/OpenShift clusters via kubeconfig or in-cluster ServiceAccount, retrieves secrets, and discovers TLS-related secrets in a namespace. Works with any provider (OpenShift, GKE, EKS, AKS).
+- **Search & query** (`search`) — filter assets by CN (substring match), secret name, namespace, or cluster; combine multiple filters with AND logic
 
 ### Planned
 
-- **Search & query** — find assets by CN, secret name, namespace, or cluster
 - **Cross-reference map** — show where the same cert lives across locations, CA inventory, keystore+truststore relationship analysis
 - **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
 - **Auto-discovery** — scan clusters and generate YAML inventory from existing Secrets
@@ -77,6 +81,7 @@ assets:
   - id: energia-api
     cluster: prod-ocp
     namespace: energia-prod
+    cn: energia-api.example.com
     certType: keystore
 
     keystore:
