@@ -133,7 +133,11 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
                 data, optional_password.encode() if optional_password is not None else None
             )
         except ValueError:
-            raise ValueError("unable to decrypt PKCS12 file, try providing a password with --password")
+            try:
+                # If the initial load failed, try with an empty password as a fallback.
+                _key, cert, additional_certs = pkcs12.load_key_and_certificates(data, b"")
+            except Exception:
+                raise ValueError("unable to decrypt PKCS12 file, wrong password or no password provided, try providing a password with --password")
         except Exception as e:
             raise ValueError(f"failed to load PKCS12 file: {e}")
         if cert is None:
