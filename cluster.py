@@ -2,7 +2,6 @@ import base64
 
 from kubernetes import config, client
 
- 
 
 # connect establishes a connection to a Kubernetes/OpenShift cluster.
 # It configures the kubernetes client globally — after calling connect(),
@@ -54,15 +53,10 @@ def get_secret_key(namespace: str, name: str, key: str) -> bytes:
     
     return base64.b64decode(secret.data[key])
 
-# get_tls_password is a helper function to retrieve TLS passwords from Secrets.
-# It works the same as get_secret_key but is named specifically for TLS passwords
-# to make it clear in the code when we're retrieving a password vs a cert/key.
+# get_tls_password is a semantic alias for get_secret_key, named to make it
+# clear in the code when we're retrieving a password vs a cert/key.
 def get_tls_password(namespace: str, name: str, key: str) -> bytes:
-    
-    secret = client.CoreV1Api().read_namespaced_secret(name=name, namespace=namespace)
-    if key not in secret.data:
-        raise KeyError(f"Secret '{name}' does not contain key '{key}'")
-    return base64.b64decode(secret.data[key])
+    return get_secret_key(namespace, name, key)
 
 
 # list_tls_passwords lists all Secrets in a namespace that contain keys that look like passwords.

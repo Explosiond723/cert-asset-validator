@@ -145,13 +145,16 @@ def cmd_validate(args):
         print(f"Clusters defined: {', '.join(cluster_names)}")
         print("----")
 
-    # Validate each asset
+    # Validate each asset independently, all errors are reported before exiting
+    had_error = False
     for i, cfg in enumerate(assets):
+        asset_id = cfg.get("id", f"asset[{i}]") if isinstance(cfg, dict) else f"asset[{i}]"
         try:
             validate_config(cfg, cluster_names)
         except ValueError as ve:
-            asset_id = cfg.get("id", f"asset[{i}]")
-            raise ValueError(f"{asset_id}: {ve}")
+            print(f"error: {asset_id}: {ve}")
+            had_error = True
+            continue
         print("Asset ID: ", cfg["id"])
         if "cluster" in cfg:
             print("Cluster:  ", cfg["cluster"])
@@ -160,6 +163,9 @@ def cmd_validate(args):
         print("certType: ", cfg["certType"])
         print("mTLS:     ", cfg.get("mtls", False))
         print("----")
+
+    if had_error:
+        sys.exit(1)
 
 
 def cmd_analyse(args):
@@ -218,10 +224,10 @@ def cmd_search(args):
     assets = cfg["assets"]
     cluster_names = [c["name"] for c in clusters]
     for i, asset in enumerate(assets):
+        asset_id = asset.get("id", f"asset[{i}]") if isinstance(asset, dict) else f"asset[{i}]"
         try:
             validate_config(asset, cluster_names)
         except ValueError as ve:
-            asset_id = asset.get("id", f"asset[{i}]")
             raise ValueError(f"{asset_id}: {ve}")
     
     if args.namespace:
@@ -240,8 +246,8 @@ def cmd_search(args):
         print(f"  {asset['id']}  |  {asset.get('cluster', 'N/A')}  |  {asset['namespace']}  |  {asset['cn']}  |  {asset['certType']}")
         print("----")
     
-    return assets
-    
+
+
 
 
 if __name__ == "__main__":
