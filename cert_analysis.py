@@ -84,7 +84,7 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
 
 
 def _extract_cert_metadata(cert, alias: str = None) -> dict:
-    """Extract common metadata from a cryptography x509.Certificate object."""
+    # Extract common metadata from a cryptography x509.Certificate object.
     metadata = {
         "subject": cert.subject.rfc4514_string(),
         "issuer": cert.issuer.rfc4514_string(),

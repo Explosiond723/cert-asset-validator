@@ -372,7 +372,10 @@ python main.py discover --live --namespace energia-prod --output assets.yaml
 These are smaller enhancements to the existing `cert_analysis.py` that add value at any point:
 
 - ~~**PEM chain handling**~~ — DONE: `cert_metadata_extract` uses `load_pem_x509_certificates` (plural) to handle concatenated PEM chains
-- **Expiration warnings** — days remaining, flag if expired or expiring within 30 days
+- **Expiration warnings** — days remaining, flag if expired or expiring within N days
+  - **Option A: in `_extract_cert_metadata`** — compute `days_remaining` and a human-readable `expires_in` label and add them to the metadata dict. Every caller (offline `analyse`, future `--live`) gets expiration data automatically.
+  - **Option B: in `cmd_analyse` only** — compute and display expiration at print time. Simpler, but `--live` and `map` won't see it without duplicating the logic.
+  - The threshold for "expiring soon" (30 days? 60? 90?) could be hardcoded or a `--warn-days` flag.
 - **Self-signed detection** — Subject == Issuer check
 - **JKS magic-byte check** — `0xFEEDFEED` pre-filter before full parse
 - **Cross-validation** — detected format vs declared `certType`, EKU vs `mtls` flag
