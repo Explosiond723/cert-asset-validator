@@ -8,22 +8,31 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 ### Cert analysis library (`cert_analysis.py`) — DONE
 
-- `cert_format(data, path, optional_password)` — probes raw bytes: PEM → DER → PKCS12 → JKS
+- `cert_format(data, path, optional_password)` — probes raw bytes: PEM → DER → JKS/JCEKS (magic number) → PKCS12
 - `cert_metadata_extract(data, cert_type, optional_password)` — returns subject, issuer, serial, validity, SANs, EKU
 - `eku_inspect(metadata)` — flags mTLS candidates (serverAuth + clientAuth)
-- `_extract_cert_metadata(cert, alias)` — shared helper for consistent extraction
+- `_extract_cert_metadata(cert, alias, now)` — shared helper for consistent extraction; SANs rendered openssl-style (`DNS:`, `IP:`, `email:`, `URI:`, ...; `otherName:UPN:user@example.com`, hex for non-text otherName values), EKUs by short name (dotted OID when unknown), plus expiry fields
+- `expiry_warning(metadata, warn_days)` — one-line warning for expired, not-yet-valid, or soon-to-expire certs
+- `pyjks` is imported lazily: PEM/DER/PKCS12 analysis works without it
 
 ### YAML validation (`main.py`) — DONE
 
 - `load_config(path)` / `validate_config(cfg, cluster_names)` — validates required fields based on `certType`, validates cluster references
 - `validate_cluster(cluster)` — validates cluster definitions (name + context)
-- Argparse CLI with `validate`, `analyse`, `csr`, and `search` subcommands
+- Argparse CLI with `validate`, `analyse`, `csr`, and `search` subcommands (`build_parser()` / `main(argv)`, testable without a subprocess)
+- `cluster.py` is not imported by `main.py`: offline commands do not need the `kubernetes` package. Import it inside the command that needs it when `--live` is wired in.
 - Top-level error handling with `sys.exit(1)` for clean CLI output
 - Logging with `-v`/`--verbose` flag
 
 ### Test certificates — DONE
 
-`test_certs/` contains PEM, DER, PKCS12 (with/without password), JKS, and intentionally invalid files.
+`test_certs/` contains PEM, DER, PKCS12 (with/without password), JKS, and intentionally invalid files. `withpass.p12` uses the password `secret`. The fixtures expire on 2027-02-27; date-dependent tests use generated certs instead.
+
+### Test suite (pytest) — DONE
+
+`tests/` covers format detection, metadata extraction, SAN/EKU formatting, expiry boundaries (with a fixed `now`), CSR generation (RSA + EC), JKS round-trip (generated with pyjks), and the CLI (`validate`, `search`, `analyse`, `csr`, exit codes, `--warn-days`, `-v` position). It also runs `validate`, `search`, `analyse` (PEM, DER, PKCS12) and `csr` in a subprocess with `kubernetes` and `pyjks` unavailable, and the suite itself passes without pyjks (JKS tests are skipped). Run with `python -m pytest` after `pip install -r requirements-dev.txt`.
+
+Not covered yet: `cluster.py` (needs a mocked `CoreV1Api` or a kind cluster), JKS `PrivateKeyEntry` (not extracted at all today, only `TrustedCertEntry`).
 
 ---
 
@@ -372,12 +381,9 @@ python main.py discover --live --namespace energia-prod --output assets.yaml
 These are smaller enhancements to the existing `cert_analysis.py` that add value at any point:
 
 - ~~**PEM chain handling**~~ — DONE: `cert_metadata_extract` uses `load_pem_x509_certificates` (plural) to handle concatenated PEM chains
-- **Expiration warnings** — days remaining, flag if expired or expiring within N days
-  - **Option A: in `_extract_cert_metadata`** — compute `days_remaining` and a human-readable `expires_in` label and add them to the metadata dict. Every caller (offline `analyse`, future `--live`) gets expiration data automatically.
-  - **Option B: in `cmd_analyse` only** — compute and display expiration at print time. Simpler, but `--live` and `map` won't see it without duplicating the logic.
-  - The threshold for "expiring soon" (30 days? 60? 90?) could be hardcoded or a `--warn-days` flag.
+- ~~**Expiration warnings**~~ — DONE (option A): `_extract_cert_metadata` adds `validity_status` (`valid` / `expired` / `not_yet_valid`), `days_remaining` (counted towards zero, negative once expired, always consistent with the label) and an `expiry` label to every cert's metadata, so `--live` and `map` get it for free. The threshold is applied separately by `expiry_warning(metadata, warn_days)`; `analyse --warn-days N` (default 30, inclusive) controls it. `analyse` still exits 0 on expired certs — a `--fail-on-expiry`-style exit code for pipelines is a possible follow-up.
 - **Self-signed detection** — Subject == Issuer check
-- **JKS magic-byte check** — `0xFEEDFEED` pre-filter before full parse
+- ~~**JKS magic-byte check**~~ — DONE: `cert_format` matches `0xFEEDFEED` (JKS) / `0xCECECECE` (JCEKS) without needing pyjks or the password, so a missing or wrong password is reported as such instead of "unable to detect certificate format"
 - **Cross-validation** — detected format vs declared `certType`, EKU vs `mtls` flag
 
 ---

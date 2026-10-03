@@ -1,13 +1,28 @@
 import logging
+from datetime import datetime, timezone
 
 from cryptography import x509
 from cryptography.x509.extensions import ExtensionNotFound
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.primitives.serialization import pkcs12
-import jks
 
 logger = logging.getLogger(__name__)
+
+# First 4 bytes of a Java KeyStore (JKS) and of a JCEKS store.
+JKS_MAGIC = b"\xfe\xed\xfe\xed"
+JCEKS_MAGIC = b"\xce\xce\xce\xce"
+
+
+# _load_jks imports pyjks only when a real JKS keystore has to be parsed.
+# pyjks pulls in the twofish C extension, which needs python3-devel to build;
+# importing it lazily keeps PEM/DER/PKCS12 analysis working without it.
+def _load_jks():
+    try:
+        import jks
+    except ImportError:
+        raise ValueError("JKS support requires the 'pyjks' package, install it with: pip install pyjks")
+    return jks
 
 # cert_format takes raw cert bytes and identifies which type of TLS cert it is.
 # Also verifies if path contains multiple certificates concatenated in a single file (certificate chain)
@@ -36,6 +51,13 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
     except Exception:
         pass
 
+    # Try JKS / JCEKS by magic number. This is the same check pyjks performs before
+    # anything else, but it needs neither pyjks nor the password: a missing or wrong
+    # password is then reported by cert_metadata_extract instead of "unknown format".
+    if data[:4] in (JKS_MAGIC, JCEKS_MAGIC):
+        logger.info("Certificate format: JKS")
+        return "JKS"
+
     # Try PKCS12
     # We attempt with an empty password first. If it succeeds, no password is needed.
     # If a password was provided, we also try that — this gives a definitive answer
@@ -63,28 +85,107 @@ def cert_format(data: bytes, path: str = "", optional_password: str = None) -> s
     except Exception:
         pass
 
-    # Try JKS — first check the extension, then try PKCS12 (some .jks files are PKCS12 underneath),
-    # then fall back to the jks library.
+    # Some .jks files are PKCS12 underneath (the keytool default since Java 9).
+    # Real JKS/JCEKS stores were already matched by their magic number above.
     if path.endswith(".jks"):
         try:
             pkcs12.load_key_and_certificates(data, b"")
             logger.info("Certificate format: JKS (PKCS12 underneath)")
             return "JKS"
         except Exception:
-            # Now try to load it as a JKS with the 'jks' library.
-            if optional_password is not None:
-                try:
-                    jks.KeyStore.loads(data, optional_password)
-                    logger.info("Certificate format: JKS")
-                    return "JKS"
-                except Exception:
-                    pass
+            pass
 
     return None
 
 
-def _extract_cert_metadata(cert, alias: str = None) -> dict:
+# _format_general_name renders a SAN entry the way openssl does ("DNS:example.com",
+# "IP:10.0.0.1", ...) instead of the repr of the cryptography object.
+def _format_general_name(name) -> str:
+    if isinstance(name, x509.DNSName):
+        return f"DNS:{name.value}"
+    if isinstance(name, x509.IPAddress):
+        return f"IP:{name.value}"
+    if isinstance(name, x509.RFC822Name):
+        return f"email:{name.value}"
+    if isinstance(name, x509.UniformResourceIdentifier):
+        return f"URI:{name.value}"
+    if isinstance(name, x509.DirectoryName):
+        return f"DirName:{name.value.rfc4514_string()}"
+    if isinstance(name, x509.RegisteredID):
+        return f"RID:{name.value.dotted_string}"
+    if isinstance(name, x509.OtherName):
+        return _format_other_name(name)
+    return str(name)
+
+
+# Microsoft User Principal Name, the most common otherName (smartcard / AD client certs).
+_UPN_OID = "1.3.6.1.4.1.311.20.2.3"
+# DER string tags whose content is plain text: UTF8String, PrintableString, IA5String.
+_DER_TEXT_TAGS = (0x0C, 0x13, 0x16)
+
+
+# _format_other_name renders an otherName SAN as "otherName:<type>:<value>". The value is
+# the DER encoding of an arbitrary ASN.1 type: simple text strings are decoded, anything
+# else is shown as hex so that the identity is never silently dropped.
+def _format_other_name(name) -> str:
+    type_id = name.type_id.dotted_string
+    label = "UPN" if type_id == _UPN_OID else type_id
+    value = name.value
+    # short-form DER length (< 128 bytes) is enough for any realistic name
+    if len(value) >= 2 and value[0] in _DER_TEXT_TAGS and value[1] == len(value) - 2:
+        try:
+            return f"otherName:{label}:{value[2:].decode('utf-8')}"
+        except UnicodeDecodeError:
+            pass
+    return f"otherName:{label}:{value.hex()}"
+
+
+# _format_oid returns the short name of an OID (e.g. "serverAuth"), or its dotted
+# string when cryptography does not know it (custom/private EKUs).
+def _format_oid(oid) -> str:
+    name = getattr(oid, "_name", "Unknown OID")
+    return oid.dotted_string if name == "Unknown OID" else name
+
+
+def _plural_days(n: int) -> str:
+    return f"{n} day" if n == 1 else f"{n} days"
+
+
+# _expiry_fields computes how long a certificate is still valid, relative to `now`.
+# The "expiring soon" threshold is NOT applied here: callers pick it (see expiry_warning).
+#   validity_status: "valid", "expired" or "not_yet_valid"
+#   days_remaining:  whole days until not_valid_after, counted towards zero: a cert expiring
+#                    in 23 hours gives 0, one that expired 3 days and 2 hours ago gives -3.
+#                    0 is ambiguous on purpose ("today"); validity_status tells the two apart.
+#   expiry:          human-readable label ("expires in 12 days", "expired 3 days ago"),
+#                    always consistent with days_remaining
+def _expiry_fields(cert, now: datetime) -> dict:
+    not_before = cert.not_valid_before_utc
+    not_after = cert.not_valid_after_utc
+
+    if now < not_before:
+        status = "not_yet_valid"
+    elif now > not_after:
+        status = "expired"
+    else:
+        status = "valid"
+
+    if status == "expired":
+        days_ago = (now - not_after).days
+        days_remaining = -days_ago
+        label = "expired today" if days_ago == 0 else f"expired {_plural_days(days_ago)} ago"
+    else:
+        days_remaining = (not_after - now).days
+        label = "expires today" if days_remaining == 0 else f"expires in {_plural_days(days_remaining)}"
+
+    return {"validity_status": status, "days_remaining": days_remaining, "expiry": label}
+
+
+def _extract_cert_metadata(cert, alias: str = None, now: datetime = None) -> dict:
     # Extract common metadata from a cryptography x509.Certificate object.
+    # `now` is only overridden by tests; it defaults to the current UTC time.
+    if now is None:
+        now = datetime.now(timezone.utc)
     metadata = {
         "subject": cert.subject.rfc4514_string(),
         "issuer": cert.issuer.rfc4514_string(),
@@ -92,22 +193,37 @@ def _extract_cert_metadata(cert, alias: str = None) -> dict:
         "not_valid_before": cert.not_valid_before_utc.isoformat(),
         "not_valid_after": cert.not_valid_after_utc.isoformat(),
     }
+    metadata.update(_expiry_fields(cert, now))
     if alias is not None:
         metadata["alias"] = alias
 
     try:
         san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-        metadata["san"] = [str(san) for san in san_ext.value]
+        metadata["san"] = [_format_general_name(san) for san in san_ext.value]
     except ExtensionNotFound:
         metadata["san"] = []
 
     try:
         eku_ext = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
-        metadata["eku"] = [str(eku) for eku in eku_ext.value]
+        metadata["eku"] = [_format_oid(eku) for eku in eku_ext.value]
     except ExtensionNotFound:
         metadata["eku"] = []
 
     return metadata
+
+
+# expiry_warning returns a one-line warning for a single cert's metadata, or None when the
+# cert is valid and has more than warn_days left. "Within N days" is inclusive: with
+# warn_days=30, a cert with exactly 30 days remaining is flagged.
+def expiry_warning(metadata: dict, warn_days: int) -> str | None:
+    status = metadata.get("validity_status")
+    if status == "expired":
+        return f"certificate {metadata['expiry']}"
+    if status == "not_yet_valid":
+        return f"certificate is not valid before {metadata['not_valid_before']}"
+    if status == "valid" and metadata["days_remaining"] <= warn_days:
+        return f"certificate {metadata['expiry']} (threshold: {_plural_days(warn_days)})"
+    return None
 
 
 # cert_metadata_extract looks for common metadata (CN, SANs, Issuer, Validity Period, Serial Number).
@@ -152,14 +268,22 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
     if cert_type == "JKS":
         if optional_password is None:
             raise ValueError("JKS keystores require a password")
+        jks = _load_jks()
         try:
             ks = jks.KeyStore.loads(data, optional_password)
         except jks.util.BadKeystoreFormatException:
             raise ValueError("not a valid JKS keystore file")
+        except jks.util.KeystoreSignatureException:
+            # pyjks verifies the store integrity hash (keyed with the password) before
+            # decrypting anything: a mismatch means a wrong password OR a damaged file,
+            # the two cannot be told apart (keytool reports it the same way).
+            raise ValueError("wrong password for JKS keystore, or keystore is corrupted (integrity check failed)")
         except jks.util.DecryptionFailureException:
             raise ValueError("wrong password for JKS keystore")
         except jks.util.UnsupportedKeystoreVersionException:
             raise ValueError("unsupported JKS keystore version")
+        except jks.util.KeystoreException as e:
+            raise ValueError(f"failed to load JKS keystore: {e}")
         metadata_list = []
         for alias, entry in ks.entries.items():
             if isinstance(entry, jks.TrustedCertEntry):

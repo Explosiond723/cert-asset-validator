@@ -2,8 +2,10 @@ import argparse
 import logging
 import sys
 import yaml
-from cert_analysis import cert_format, cert_metadata_extract, eku_inspect, csr_generate
-from cluster import connect, get_secret_key, get_tls_password, list_tls_passwords, list_tls_secrets
+from cert_analysis import cert_format, cert_metadata_extract, eku_inspect, csr_generate, expiry_warning
+# cluster.py (and the kubernetes client it needs) is deliberately NOT imported here:
+# all current subcommands work offline. Import it inside the command that needs it
+# once --live is wired in, so offline use does not require the kubernetes package.
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +187,13 @@ def cmd_analyse(args):
 
     for cert_meta in metadata:
         for key, value in cert_meta.items():
+            # lists (SANs, EKUs) are printed comma-separated instead of as a Python list
+            if isinstance(value, list):
+                value = ", ".join(value) if value else "(none)"
             print(f"  {key}: {value}")
+        warning = expiry_warning(cert_meta, args.warn_days)
+        if warning:
+            print(f"  WARNING: {warning}")
         print("----")
 
     is_mtls = eku_inspect(metadata)
@@ -250,7 +258,18 @@ def cmd_search(args):
 
 
 
-if __name__ == "__main__":
+# non_negative_int is an argparse type: rejects negative values for day thresholds.
+def non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer value: '{value}'")
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be zero or positive, got {number}")
+    return number
+
+
+def build_parser() -> argparse.ArgumentParser:
     # Main parser — this is the root command: `python main.py`
     parser = argparse.ArgumentParser(description="cert-asset-validator")
 
@@ -262,14 +281,18 @@ if __name__ == "__main__":
     # `python main.py validate <config>` — takes one positional argument (the YAML path)
     validate_parser = subparsers.add_parser("validate", help="Validate YAML asset definitions")
     validate_parser.add_argument("config", metavar="CONFIGFILE", help="Path to YAML config file")
-    validate_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
+    validate_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
-    # `python main.py analyse <cert> [--password]` — takes the cert path as positional,
-    # and an optional --password flag for PKCS12/JKS files that need one
+    # `python main.py analyse <cert> [--password] [--warn-days]` — takes the cert path as positional,
+    # an optional --password flag for PKCS12/JKS files that need one, and the expiry warning threshold
     analyse_parser = subparsers.add_parser("analyse", help="Analyse a certificate file")
     analyse_parser.add_argument("cert", metavar="FILE", help="Path to certificate file")
     analyse_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
-    analyse_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
+    analyse_parser.add_argument(
+        "--warn-days", type=non_negative_int, default=30, metavar="DAYS",
+        help="Warn when a certificate expires within DAYS days (default: 30)",
+    )
+    analyse_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
 
     # `python main.py csr <cert> [--password] [--output] [--key-output]`
@@ -279,7 +302,7 @@ if __name__ == "__main__":
     csr_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
     csr_parser.add_argument("--output", help="Output path for the CSR file (default: <cert>.csr)")
     csr_parser.add_argument("--key-output", help="Output path for the private key (default: <cert>-key.pem)")
-    csr_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
+    csr_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
     # `python main.py search <config> [--namespace] [--cluster] [--secret] [--cn]`
     # Filters assets from the YAML inventory by namespace, cluster, secret name, or CN.
@@ -290,51 +313,49 @@ if __name__ == "__main__":
     search_parser.add_argument("--cluster", help="Filter assets by cluster name")
     search_parser.add_argument("--secret", help="Filter assets by secret name")
     search_parser.add_argument("--cn", help="Filter assets by Common Name (substring match)")
-    search_parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (show INFO-level log messages)")
-    
+    search_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
+
     # Global flag (applies to all subcommands): -v / --verbose
+    # The subcommand copies of -v use default=argparse.SUPPRESS: otherwise their default
+    # (False) would overwrite a -v given before the subcommand (`main.py -v analyse ...`).
     parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable verbose output (show INFO-level log messages)",
     )
+    return parser
 
-    args = parser.parse_args()
+
+COMMANDS = {
+    "validate": cmd_validate,
+    "analyse": cmd_analyse,
+    "csr": cmd_csr,
+    "search": cmd_search,
+}
+
+
+# main is the CLI entry point. argv defaults to sys.argv[1:]; tests pass it explicitly.
+def main(argv: list[str] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     logging.basicConfig(
         format="%(levelname)s: %(message)s",
         level=logging.INFO if args.verbose else logging.WARNING,
     )
 
+    if args.command is None:
+        parser.print_help()
+        return
+
     # Top-level error handling: catch ValueErrors raised by subcommands and
     # print a clean one-line message instead of a full Python traceback.
     # sys.exit(1) signals failure to the shell (useful in scripts/pipelines).
-    if args.command is None:
-        parser.print_help()
-    elif args.command == "validate":
-        try:
-            cmd_validate(args)
-        except (ValueError, OSError) as e:
-            print(f"error: {e}")
-            sys.exit(1)
-    elif args.command == "analyse":
-        try:
-            cmd_analyse(args)
-        except (ValueError, OSError) as e:
-            print(f"error: {e}")
-            sys.exit(1)
-    elif args.command == "csr":
-        try:
-            cmd_csr(args)
-        except (ValueError, OSError) as e:
-            print(f"error: {e}")
-            sys.exit(1)
-    elif args.command == "search":
-        try:
-            cmd_search(args)
-        except (ValueError, OSError) as e:
-            print(f"error: {e}")
-            sys.exit(1)
-    else:
-        print(f"Unknown command: {args.command}")
-        parser.print_help()
+    try:
+        COMMANDS[args.command](args)
+    except (ValueError, OSError) as e:
+        print(f"error: {e}")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

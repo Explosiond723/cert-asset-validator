@@ -22,6 +22,8 @@ In real-world Kubernetes/OpenShift environments, certificates are often:
 # On Debian/Ubuntu:
 #   sudo apt install python3-dev
 pip install -r requirements.txt
+# pyjks is only needed for JKS keystores and kubernetes only for cluster access:
+# validate/analyse/csr/search on PEM, DER and PKCS12 work without them.
 
 # Validate a YAML asset definition
 python main.py validate example-cfg.yaml
@@ -31,6 +33,9 @@ python main.py analyse path/to/cert.pem
 
 # Analyse a password-protected PKCS12/JKS keystore
 python main.py analyse path/to/keystore.p12 --password mysecret
+
+# Change the expiry warning threshold (default: 30 days)
+python main.py analyse path/to/cert.pem --warn-days 60
 
 # Generate a CSR from an existing certificate
 python main.py csr path/to/cert.pem
@@ -48,6 +53,7 @@ Running `python main.py` with no arguments prints usage help.
 
 - **YAML validation** (`validate`) — parses single or multiple certificate asset definitions, validates required fields and structure based on `certType`, fails fast with human-readable errors
 - **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates
+- **Expiration warnings** — every analysed certificate reports `validity_status`, `days_remaining` and a readable `expiry` label; a `WARNING` line is printed for expired, not-yet-valid, or soon-to-expire certificates (`--warn-days`, default 30)
 - **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
 - **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate, preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions; generates a new key pair matching the original key type and size
 - **Cluster connectivity** — connects to Kubernetes/OpenShift clusters via kubeconfig or in-cluster ServiceAccount, retrieves secrets, and discovers TLS-related secrets in a namespace. Works with any provider (OpenShift, GKE, EKS, AKS).
@@ -61,6 +67,33 @@ Running `python main.py` with no arguments prints usage help.
 - **`--live` mode** — opt-in flag to connect to clusters for real-time cert analysis, search, and rotation
 
 See `ROADMAP.md` for the detailed implementation plan.
+
+## Sample output
+
+```text
+$ python main.py analyse test_certs/full.pem
+  subject: CN=test.example.com,C=US
+  issuer: CN=Test CA,C=US
+  serial_number: 634829801381407007699990377129478153637635620168
+  not_valid_before: 2026-02-27T15:29:02+00:00
+  not_valid_after: 2027-02-27T15:29:02+00:00
+  validity_status: valid
+  days_remaining: 147
+  expiry: expires in 147 days
+  san: DNS:test.example.com, DNS:*.example.com
+  eku: serverAuth, clientAuth
+----
+mTLS candidate: True
+```
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Tests live in `tests/`. They use the fixtures in `test_certs/` for format detection, and generate certificates on the fly wherever the result depends on the current date (expiry), so they do not start failing when the fixtures expire.
 
 ## Configuration model
 
