@@ -37,6 +37,10 @@ python main.py analyse path/to/keystore.p12 --password mysecret
 # Change the expiry warning threshold (default: 30 days)
 python main.py analyse path/to/cert.pem --warn-days 60
 
+# For scripts/CI: exit 1 if a cert is expired, not yet valid, or expires within --warn-days
+python main.py analyse path/to/cert.pem --warn-days 14 --fail-on-expiry
+python main.py validate example-cfg.yaml --live --fail-on-expiry
+
 # Generate a CSR from an existing certificate
 python main.py csr path/to/cert.pem
 
@@ -62,7 +66,7 @@ Running `python main.py` with no arguments prints usage help.
 
 - **YAML validation** (`validate`) — parses single or multiple certificate asset definitions, validates required fields and structure based on `certType`, fails fast with human-readable errors
 - **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates
-- **Expiration warnings** — every analysed certificate reports `validity_status`, `days_remaining` and a readable `expiry` label; a `WARNING` line is printed for expired, not-yet-valid, or soon-to-expire certificates (`--warn-days`, default 30)
+- **Expiration warnings** — every analysed certificate reports `validity_status`, `days_remaining` and a readable `expiry` label; a `WARNING` line is printed for expired, not-yet-valid, or soon-to-expire certificates (`--warn-days`, default 30). By default warnings do not change the exit code; `--fail-on-expiry` (on `analyse`, and on `validate`/`search` with `--live`) exits 1 when any certificate triggers one, with the reason on stderr so CSV output stays clean
 - **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
 - **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate (PEM, DER, PKCS12, JKS), preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions; generates a new key pair matching the original key type and size
 - **Cluster connectivity** — connects to Kubernetes/OpenShift clusters via kubeconfig or in-cluster ServiceAccount, retrieves secrets, and discovers TLS-related secrets in a namespace. Works with any provider (OpenShift, GKE, EKS, AKS).

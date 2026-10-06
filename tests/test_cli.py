@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 import main
-from conftest import REPO_ROOT, TEST_CERTS, make_cert
+from conftest import REPO_ROOT, TEST_CERTS, cert_pem, make_cert
 
 EXAMPLE_CFG = str(REPO_ROOT / "example-cfg.yaml")
 
@@ -209,6 +209,53 @@ def test_analyse_jks_password_errors_reach_the_cli(make_keystore, tmp_path, caps
     code, out = run_cli(["analyse", str(path), "--password", "changeit"], capsys)
     assert code == 0
     assert "  alias: my-ca" in out
+
+
+# --- --fail-on-expiry -----------------------------------------------------------------
+
+@pytest.mark.parametrize("days_left, extra, expected_code", [
+    (400, [], 0),                         # healthy cert: never fails
+    (10, [], 0),                          # warning only, flag not given: exit code unchanged
+    (10, ["--fail-on-expiry"], 1),
+    (10, ["--fail-on-expiry", "--warn-days", "5"], 0),
+    (-3, ["--fail-on-expiry"], 1),        # already expired
+])
+def test_analyse_fail_on_expiry(write_cert, capsys, days_left, extra, expected_code):
+    now = datetime.now(timezone.utc)
+    cert, _ = make_cert(not_before=now - timedelta(days=30), not_after=now + timedelta(days=days_left, hours=1))
+    code, _ = run_cli(["analyse", write_cert(cert), *extra], capsys)
+    assert code == expected_code
+
+
+def test_analyse_fail_on_expiry_counts_any_cert_in_chain(tmp_path, capsys):
+    now = datetime.now(timezone.utc)
+    leaf, _ = make_cert(cn="leaf", not_after=now + timedelta(days=400))
+    ca, _ = make_cert(cn="ca", not_after=now + timedelta(days=2, hours=1))
+    path = tmp_path / "chain.pem"
+    path.write_bytes(cert_pem(leaf) + cert_pem(ca))
+    code, _ = run_cli(["analyse", str(path), "--fail-on-expiry"], capsys)
+    assert code == 1
+
+
+def test_analyse_fail_on_expiry_keeps_csv_stdout_clean(write_cert, capsys):
+    import csv, io
+    cert, _ = make_cert(not_after=datetime.now(timezone.utc) + timedelta(days=3, hours=1))
+    try:
+        main.main(["analyse", write_cert(cert), "--format", "csv", "--fail-on-expiry"])
+        code = 0
+    except SystemExit as e:
+        code = e.code
+    captured = capsys.readouterr()
+    assert code == 1
+    assert len(list(csv.DictReader(io.StringIO(captured.out)))) == 1
+    assert "expiring within 30 days" in captured.err
+
+
+@pytest.mark.parametrize("command", ["validate", "search"])
+def test_fail_on_expiry_requires_live_for_inventory_commands(command):
+    with pytest.raises(SystemExit) as exc:
+        main.main([command, EXAMPLE_CFG, "--fail-on-expiry"])
+    assert exc.value.code == 2
 
 
 # --- --format ---------------------------------------------------------------------

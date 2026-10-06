@@ -99,9 +99,11 @@ def _cn_matches(yaml_cn: str, leaf: dict) -> bool:
 # inspect_asset fetches the asset's material from the cluster and cross-checks it
 # against the YAML. Never raises: cluster and parsing problems are collected in
 # result["errors"], inconsistencies and expiry in result["warnings"].
+# result["expiring"] is True when any keystore or truststore cert triggered an expiry
+# warning (expired, not yet valid, or within warn_days): used by --fail-on-expiry.
 def inspect_asset(asset: dict, clients: ClusterClients, warn_days: int) -> dict:
     result = {"id": asset["id"], "context": clients.context_for(asset), "errors": [], "warnings": [],
-              "keystore": None, "truststore": None, "leaf": None}
+              "expiring": False, "keystore": None, "truststore": None, "leaf": None}
     namespace = asset["namespace"]
 
     try:
@@ -125,6 +127,7 @@ def inspect_asset(asset: dict, clients: ClusterClients, warn_days: int) -> dict:
             warning = expiry_warning(meta, warn_days)
             if warning:
                 result["warnings"].append(f"{role}: {meta['subject']}: {warning}")
+                result["expiring"] = True
 
     if result["keystore"] is None and not result["errors"]:
         result["errors"].append("no keystore.secret reference in the YAML, nothing to inspect")

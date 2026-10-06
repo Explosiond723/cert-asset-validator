@@ -158,6 +158,7 @@ def cmd_validate(args):
 
     # Validate each asset independently, all errors are reported before exiting
     had_error = False
+    expiring = 0
     valid_assets = []
     for i, cfg in enumerate(assets):
         asset_id = cfg.get("id", f"asset[{i}]") if isinstance(cfg, dict) else f"asset[{i}]"
@@ -190,8 +191,21 @@ def cmd_validate(args):
             print_inspection(result)
             if result["errors"]:
                 had_error = True
+            if result["expiring"]:
+                expiring += 1
 
     if had_error:
+        sys.exit(1)
+    exit_on_expiry(args, expiring, "asset(s) with certificates")
+
+
+# exit_on_expiry implements --fail-on-expiry: exit 1 when `count` certificates (or assets)
+# are expired, not yet valid, or expire within --warn-days. The reason goes to stderr so
+# that --format csv output on stdout stays machine-readable.
+def exit_on_expiry(args, count: int, what: str = "certificate(s)") -> None:
+    if args.fail_on_expiry and count:
+        print(f"error: {count} {what} expired, not yet valid, or expiring within {args.warn_days} days",
+              file=sys.stderr)
         sys.exit(1)
 
 
@@ -209,6 +223,7 @@ def cmd_analyse(args):
     # normalize to list so we handle both single cert and multi-cert the same way
     if isinstance(metadata, dict):
         metadata = [metadata]
+    expiring = sum(1 for meta in metadata if expiry_warning(meta, args.warn_days))
 
     if args.format != "list":
         rows = [dict(meta, warning=expiry_warning(meta, args.warn_days)) for meta in metadata]
@@ -221,6 +236,7 @@ def cmd_analyse(args):
         if any("alias" in meta for meta in metadata):
             columns = ["alias", "entry_type"] + columns
         render_rows(rows, columns, args.format)
+        exit_on_expiry(args, expiring)
         return
 
     for cert_meta in metadata:
@@ -236,6 +252,7 @@ def cmd_analyse(args):
 
     is_mtls = eku_inspect(metadata)
     print(f"mTLS candidate: {is_mtls}")
+    exit_on_expiry(args, expiring)
 
 
 def cmd_csr(args):
@@ -297,6 +314,7 @@ def cmd_search(args):
         assets = [a for a in assets if args.cn in a["cn"]]
 
     had_error = any(results[a["id"]]["errors"] for a in assets) if args.live else False
+    expiring = sum(1 for a in assets if results[a["id"]]["expiring"]) if args.live else 0
 
     if args.format != "list":
         rows = []
@@ -314,6 +332,7 @@ def cmd_search(args):
         render_rows(rows, columns, args.format)
         if had_error:
             sys.exit(1)
+        exit_on_expiry(args, expiring, "asset(s) with certificates")
         return
 
     print(f"Found {len(assets)} matching assets:")
@@ -334,8 +353,7 @@ def cmd_search(args):
 
     if had_error:
         sys.exit(1)
-
-
+    exit_on_expiry(args, expiring, "asset(s) with certificates")
 
 
 # non_negative_int is an argparse type: rejects negative values for day thresholds.
@@ -356,6 +374,15 @@ def add_format_argument(subparser: argparse.ArgumentParser) -> None:
                            help="Output format: list (default, human-readable), table, or csv")
 
 
+# add_fail_on_expiry_argument adds --fail-on-expiry, the pipeline-friendly counterpart
+# of the WARNING lines (same idea as `openssl x509 -checkend`).
+def add_fail_on_expiry_argument(subparser: argparse.ArgumentParser, note: str = None) -> None:
+    help_text = "Exit with status 1 if a certificate is expired, not yet valid, or expires within --warn-days"
+    if note:
+        help_text += f" ({note})"
+    subparser.add_argument("--fail-on-expiry", action="store_true", help=help_text)
+
+
 # add_live_arguments adds the cluster-access flags shared by the inventory commands.
 def add_live_arguments(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("--live", action="store_true",
@@ -366,6 +393,7 @@ def add_live_arguments(subparser: argparse.ArgumentParser) -> None:
         "--warn-days", type=non_negative_int, default=30, metavar="DAYS",
         help="With --live, warn when a certificate expires within DAYS days (default: 30)",
     )
+    add_fail_on_expiry_argument(subparser, "requires --live")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -392,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--warn-days", type=non_negative_int, default=30, metavar="DAYS",
         help="Warn when a certificate expires within DAYS days (default: 30)",
     )
+    add_fail_on_expiry_argument(analyse_parser)
     add_format_argument(analyse_parser)
     analyse_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
@@ -452,6 +481,8 @@ def main(argv: list[str] = None) -> None:
 
     if not getattr(args, "live", False) and (getattr(args, "context", None) or getattr(args, "kubeconfig", None)):
         parser.error("--context and --kubeconfig require --live")
+    if args.command in ("validate", "search") and args.fail_on_expiry and not args.live:
+        parser.error("--fail-on-expiry requires --live for validate and search (the YAML holds no certificate data)")
 
     # Top-level error handling: catch ValueErrors raised by subcommands and
     # print a clean one-line message instead of a full Python traceback.
