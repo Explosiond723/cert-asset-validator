@@ -212,9 +212,20 @@ def test_csr_from_pkcs12_fixture():
     assert csr.subject.rfc4514_string() == "CN=test.example.com,C=US"
 
 
-def test_csr_rejects_jks():
+def test_csr_rejects_unknown_format():
     with pytest.raises(ValueError, match="not supported"):
-        csr_generate(b"irrelevant", "JKS")
+        csr_generate(b"irrelevant", "XYZ")
+
+
+def test_csr_from_jks_uses_private_key_entry(make_keystore):
+    data = make_keystore(leaf_cn="server.example.com")
+    csr = x509.load_pem_x509_csr(csr_generate(data, "JKS", "changeit")[0])
+    assert "CN=server.example.com" in csr.subject.rfc4514_string()
+
+    with pytest.raises(ValueError, match="wrong password"):
+        csr_generate(data, "JKS", "wrong")
+    with pytest.raises(ValueError, match="no private key entry"):
+        csr_generate(make_keystore(), "JKS", "changeit")
 
 
 # --- JKS (generated with pyjks; skipped when pyjks is not installed) --------
@@ -233,6 +244,19 @@ def test_jks_trusted_cert_roundtrip(make_keystore):
         cert_metadata_extract(data, "JKS", "wrong")
     with pytest.raises(ValueError, match="require a password"):
         cert_metadata_extract(data, "JKS", None)
+
+
+def test_jks_private_key_entry_chain_comes_first(make_keystore):
+    metas = cert_metadata_extract(make_keystore(leaf_cn="server.example.com"), "JKS", "changeit")
+    assert [(m["alias"], m["entry_type"], m["common_name"]) for m in metas] == [
+        ("server", "PrivateKeyEntry", "server.example.com"),
+        ("server", "PrivateKeyEntry", "jks.example.com"),
+        ("my-ca", "TrustedCertEntry", "jks.example.com"),
+    ]
+
+
+def test_common_name_field():
+    assert cert_metadata_extract(read("full.pem"), "PEM")["common_name"] == "test.example.com"
 
 
 def test_corrupted_jks_mentions_corruption(make_keystore):

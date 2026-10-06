@@ -3,9 +3,10 @@ import logging
 import sys
 import yaml
 from cert_analysis import cert_format, cert_metadata_extract, eku_inspect, csr_generate, expiry_warning
-# cluster.py (and the kubernetes client it needs) is deliberately NOT imported here:
-# all current subcommands work offline. Import it inside the command that needs it
-# once --live is wired in, so offline use does not require the kubernetes package.
+from output import FORMATS, render_rows
+# live.py / cluster.py (and the kubernetes client they need) are deliberately NOT imported
+# here: they are imported by make_live_clients() only when --live is used, so offline
+# use does not require the kubernetes package.
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,14 @@ def validate_config(cfg: dict, cluster_names: list[str]) -> None:
         raise ValueError("field 'mtls' must be boolean")
 
 
+# make_live_clients prepares cluster access for --live. clusters is the validated
+# clusters section; each asset is routed to its cluster's kubeconfig context.
+def make_live_clients(args, clusters: list[dict]):
+    from live import ClusterClients
+    contexts = {c["name"]: c["context"] for c in clusters}
+    return ClusterClients(contexts, kubeconfig=args.kubeconfig, context_override=args.context)
+
+
 def cmd_validate(args):
     config = load_config(args.config)
     clusters = config["clusters"]
@@ -149,6 +158,7 @@ def cmd_validate(args):
 
     # Validate each asset independently, all errors are reported before exiting
     had_error = False
+    valid_assets = []
     for i, cfg in enumerate(assets):
         asset_id = cfg.get("id", f"asset[{i}]") if isinstance(cfg, dict) else f"asset[{i}]"
         try:
@@ -165,6 +175,21 @@ def cmd_validate(args):
         print("certType: ", cfg["certType"])
         print("mTLS:     ", cfg.get("mtls", False))
         print("----")
+        valid_assets.append(cfg)
+
+    # --live: inspect the real material of every asset that passed offline validation.
+    # Each asset is checked independently; one unreachable cluster or missing Secret
+    # does not stop the others.
+    if args.live and valid_assets:
+        from live import inspect_asset, print_inspection
+        clients = make_live_clients(args, clusters)
+        print("Live checks:")
+        print("----")
+        for cfg in valid_assets:
+            result = inspect_asset(cfg, clients, args.warn_days)
+            print_inspection(result)
+            if result["errors"]:
+                had_error = True
 
     if had_error:
         sys.exit(1)
@@ -184,6 +209,19 @@ def cmd_analyse(args):
     # normalize to list so we handle both single cert and multi-cert the same way
     if isinstance(metadata, dict):
         metadata = [metadata]
+
+    if args.format != "list":
+        rows = [dict(meta, warning=expiry_warning(meta, args.warn_days)) for meta in metadata]
+        # csv carries every field; table keeps the columns that fit a terminal
+        if args.format == "csv":
+            columns = ["subject", "issuer", "serial_number", "not_valid_before", "not_valid_after",
+                       "validity_status", "days_remaining", "san", "eku", "warning"]
+        else:
+            columns = ["subject", "not_valid_after", "validity_status", "days_remaining", "san", "warning"]
+        if any("alias" in meta for meta in metadata):
+            columns = ["alias", "entry_type"] + columns
+        render_rows(rows, columns, args.format)
+        return
 
     for cert_meta in metadata:
         for key, value in cert_meta.items():
@@ -244,16 +282,58 @@ def cmd_search(args):
         assets = [a for a in assets if a.get("cluster") == args.cluster]
     if args.secret:
         assets = [a for a in assets if a.get("keystore", {}).get("secret", {}).get("name") == args.secret or a.get("truststore", {}).get("secret", {}).get("name") == args.secret]
-    if args.cn:
+
+    # Offline, --cn matches the YAML cn. With --live it also matches the real CN and
+    # SANs, so every asset passing the other filters has to be fetched first.
+    results = {}
+    if args.live:
+        from live import inspect_asset, live_matches_cn
+        clients = make_live_clients(args, clusters)
+        for asset in assets:
+            results[asset["id"]] = inspect_asset(asset, clients, args.warn_days)
+        if args.cn:
+            assets = [a for a in assets if live_matches_cn(a, results[a["id"]], args.cn)]
+    elif args.cn:
         assets = [a for a in assets if args.cn in a["cn"]]
-    
+
+    had_error = any(results[a["id"]]["errors"] for a in assets) if args.live else False
+
+    if args.format != "list":
+        rows = []
+        for asset in assets:
+            row = {"id": asset["id"], "cluster": asset.get("cluster", ""), "namespace": asset["namespace"],
+                   "cn": asset["cn"], "certType": asset["certType"]}
+            if args.live:
+                result = results[asset["id"]]
+                leaf = result["leaf"] or {}
+                row.update({"live_subject": leaf.get("subject"), "not_valid_after": leaf.get("not_valid_after"),
+                            "days_remaining": leaf.get("days_remaining"), "expiry": leaf.get("expiry"),
+                            "san": leaf.get("san"), "warnings": result["warnings"], "errors": result["errors"]})
+            rows.append(row)
+        columns = list(rows[0].keys()) if rows else ["id", "cluster", "namespace", "cn", "certType"]
+        render_rows(rows, columns, args.format)
+        if had_error:
+            sys.exit(1)
+        return
+
     print(f"Found {len(assets)} matching assets:")
     print("----")
 
     for asset in assets:
         print(f"  {asset['id']}  |  {asset.get('cluster', 'N/A')}  |  {asset['namespace']}  |  {asset['cn']}  |  {asset['certType']}")
+        if args.live:
+            result = results[asset["id"]]
+            leaf = result["leaf"]
+            if leaf:
+                print(f"    live: {leaf['subject']}  |  {leaf['expiry']}  |  SAN: {', '.join(leaf['san']) or '(none)'}")
+            for warning in result["warnings"]:
+                print(f"    WARNING: {warning}")
+            for error in result["errors"]:
+                print(f"    ERROR: {error}")
         print("----")
-    
+
+    if had_error:
+        sys.exit(1)
 
 
 
@@ -269,6 +349,25 @@ def non_negative_int(value: str) -> int:
     return number
 
 
+# add_format_argument adds --format. Named --format, not --output, because
+# `csr --output` already means "file to write the CSR to".
+def add_format_argument(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("--format", choices=FORMATS, default="list",
+                           help="Output format: list (default, human-readable), table, or csv")
+
+
+# add_live_arguments adds the cluster-access flags shared by the inventory commands.
+def add_live_arguments(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("--live", action="store_true",
+                           help="Connect to the clusters and inspect the real certificates (read-only)")
+    subparser.add_argument("--context", help="Use this kubeconfig context for all clusters (requires --live)")
+    subparser.add_argument("--kubeconfig", metavar="PATH", help="Path to a kubeconfig file (requires --live)")
+    subparser.add_argument(
+        "--warn-days", type=non_negative_int, default=30, metavar="DAYS",
+        help="With --live, warn when a certificate expires within DAYS days (default: 30)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Main parser — this is the root command: `python main.py`
     parser = argparse.ArgumentParser(description="cert-asset-validator")
@@ -281,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     # `python main.py validate <config>` — takes one positional argument (the YAML path)
     validate_parser = subparsers.add_parser("validate", help="Validate YAML asset definitions")
     validate_parser.add_argument("config", metavar="CONFIGFILE", help="Path to YAML config file")
+    add_live_arguments(validate_parser)
     validate_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
     # `python main.py analyse <cert> [--password] [--warn-days]` — takes the cert path as positional,
@@ -292,6 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--warn-days", type=non_negative_int, default=30, metavar="DAYS",
         help="Warn when a certificate expires within DAYS days (default: 30)",
     )
+    add_format_argument(analyse_parser)
     analyse_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
 
@@ -312,7 +413,9 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--namespace", help="Filter assets by namespace")
     search_parser.add_argument("--cluster", help="Filter assets by cluster name")
     search_parser.add_argument("--secret", help="Filter assets by secret name")
-    search_parser.add_argument("--cn", help="Filter assets by Common Name (substring match)")
+    search_parser.add_argument("--cn", help="Filter assets by Common Name (substring match; with --live also the real CN and SANs)")
+    add_live_arguments(search_parser)
+    add_format_argument(search_parser)
     search_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
     # Global flag (applies to all subcommands): -v / --verbose
@@ -346,6 +449,9 @@ def main(argv: list[str] = None) -> None:
     if args.command is None:
         parser.print_help()
         return
+
+    if not getattr(args, "live", False) and (getattr(args, "context", None) or getattr(args, "kubeconfig", None)):
+        parser.error("--context and --kubeconfig require --live")
 
     # Top-level error handling: catch ValueErrors raised by subcommands and
     # print a clean one-line message instead of a full Python traceback.

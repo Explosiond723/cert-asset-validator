@@ -43,6 +43,15 @@ python main.py csr path/to/cert.pem
 # Search assets by CN, namespace, cluster, or secret name
 python main.py search example-cfg.yaml --cn "energia"
 python main.py search example-cfg.yaml --namespace energia-prod --cluster prod-ocp
+
+# Output as an aligned table or CSV instead of the default list
+python main.py search example-cfg.yaml --format table
+python main.py analyse path/to/keystore.p12 --password mysecret --format csv > certs.csv
+
+# Live mode (read-only): fetch the real certificates from the clusters
+python main.py validate example-cfg.yaml --live
+python main.py search example-cfg.yaml --live --cn "api" --format table
+python main.py search example-cfg.yaml --live --context kind-test --kubeconfig ~/.kube/kind
 ```
 
 Running `python main.py` with no arguments prints usage help.
@@ -55,16 +64,18 @@ Running `python main.py` with no arguments prints usage help.
 - **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates
 - **Expiration warnings** — every analysed certificate reports `validity_status`, `days_remaining` and a readable `expiry` label; a `WARNING` line is printed for expired, not-yet-valid, or soon-to-expire certificates (`--warn-days`, default 30)
 - **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
-- **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate, preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions; generates a new key pair matching the original key type and size
+- **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate (PEM, DER, PKCS12, JKS), preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions; generates a new key pair matching the original key type and size
 - **Cluster connectivity** — connects to Kubernetes/OpenShift clusters via kubeconfig or in-cluster ServiceAccount, retrieves secrets, and discovers TLS-related secrets in a namespace. Works with any provider (OpenShift, GKE, EKS, AKS).
 - **Search & query** (`search`) — filter assets by CN (substring match), secret name, namespace, or cluster; combine multiple filters with AND logic
+- **Live mode** (`validate --live`, `search --live`) — read-only: fetches each asset's keystore/truststore and password from its Secrets, analyses the real certificates, and cross-checks them against the YAML (declared `certType` vs actual format, `cn` vs real CN/SANs, `mtls` without truststore, expiry). Each asset is checked independently: an unreachable cluster or a missing Secret is reported for that asset and the run continues; the exit code is 1 if any asset had errors. With `--live`, `search --cn` also matches the real CN and SANs.
+- **Output formats** (`--format list|table|csv` on `search` and `analyse`) — `list` is the default human-readable layout; `table` is an aligned view; `csv` carries every field, one row per asset or certificate, multi-value cells joined with `; `
 
 ### Planned
 
 - **Cross-reference map** — show where the same cert lives across locations, CA inventory, keystore+truststore relationship analysis
 - **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
 - **Auto-discovery** — scan clusters and generate YAML inventory from existing Secrets
-- **`--live` mode** — opt-in flag to connect to clusters for real-time cert analysis, search, and rotation
+- **`--live` for `csr` and rotation** — generate CSRs and rotate certs by asset id directly from the cluster
 
 See `ROADMAP.md` for the detailed implementation plan.
 
@@ -146,6 +157,10 @@ The tool relies on the user's existing Kubernetes auth context:
 - **In-cluster ServiceAccount** — when running inside a pod, the tool picks up the mounted token automatically. The user creates the ServiceAccount and RBAC.
 
 All cluster operations are opt-in via the `--live` flag. Default behaviour is offline validation only.
+
+Context selection with `--live`: each asset uses the `context` of its cluster from the YAML; `--context` overrides it for every asset (useful for a local kind cluster); `--kubeconfig` points to a non-default kubeconfig file. Without clusters in the YAML (legacy format) and without `--context`, the tool tries the in-cluster ServiceAccount first, then the kubeconfig current context.
+
+Live mode only reads Secrets: the identity in use needs `get` on `secrets` in each asset's namespace. Passwords read from `passwordRef` are used in memory only and never printed (a trailing newline, as left by `echo pass | oc create secret ...`, is stripped).
 
 ## License
 

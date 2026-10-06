@@ -71,14 +71,24 @@ def write_cert(tmp_path):
 
 @pytest.fixture
 def make_keystore():
-    """Return a function building a JKS store (password "changeit") with one trusted cert."""
+    """Return a function building a JKS store (password "changeit").
+
+    Default: one trusted cert (alias "my-ca"), like a truststore. With leaf_cn set, a
+    private key entry (alias "server") with chain [leaf, ca] is added first, like a keystore.
+    """
     jks = pytest.importorskip("jks")
 
-    def _make(password: str = "changeit") -> bytes:
-        cert, _ = make_cert(cn="jks.example.com", sans=[x509.DNSName("jks.example.com")])
-        der = cert.public_bytes(serialization.Encoding.DER)
-        entry = jks.TrustedCertEntry.new("my-ca", der)
-        return jks.KeyStore.new("jks", [entry]).saves(password)
+    def _make(password: str = "changeit", leaf_cn: str = None, leaf_not_after: datetime = None) -> bytes:
+        ca, _ = make_cert(cn="jks.example.com", sans=[x509.DNSName("jks.example.com")])
+        der = lambda c: c.public_bytes(serialization.Encoding.DER)
+        entries = []
+        if leaf_cn:
+            leaf, key = make_cert(cn=leaf_cn, sans=[x509.DNSName(leaf_cn)], not_after=leaf_not_after)
+            key_der = key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
+                                        serialization.NoEncryption())
+            entries.append(jks.PrivateKeyEntry.new("server", [der(leaf), der(ca)], key_der))
+        entries.append(jks.TrustedCertEntry.new("my-ca", der(ca)))
+        return jks.KeyStore.new("jks", entries).saves(password)
     return _make
 
 

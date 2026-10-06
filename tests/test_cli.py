@@ -211,6 +211,58 @@ def test_analyse_jks_password_errors_reach_the_cli(make_keystore, tmp_path, caps
     assert "  alias: my-ca" in out
 
 
+# --- --format ---------------------------------------------------------------------
+
+def test_search_csv_is_parseable(capsys):
+    import csv, io
+    code, out = run_cli(["search", EXAMPLE_CFG, "--format", "csv", "--cluster", "prod-ocp"], capsys)
+    assert code == 0
+    rows = list(csv.DictReader(io.StringIO(out)))
+    assert [r["id"] for r in rows] == ["energia-api", "public-web"]
+    assert rows[0]["cn"] == "energia-api.example.com"
+
+
+def test_search_table_has_header_and_aligned_rows(capsys):
+    code, out = run_cli(["search", EXAMPLE_CFG, "--format", "table"], capsys)
+    lines = out.splitlines()
+    assert code == 0
+    assert lines[0].split() == ["ID", "CLUSTER", "NAMESPACE", "CN", "CERTTYPE"]
+    assert len(lines) == 4
+    # every column starts at the same offset on every line
+    offset = lines[0].index("CLUSTER")
+    assert all(line[offset - 2:offset] == "  " for line in lines[1:])
+
+
+def test_search_table_with_no_match_prints_only_header(capsys):
+    code, out = run_cli(["search", EXAMPLE_CFG, "--format", "table", "--cn", "nothing"], capsys)
+    assert code == 0
+    assert out.splitlines() == ["ID  CLUSTER  NAMESPACE  CN  CERTTYPE"]
+
+
+def test_analyse_csv_one_row_per_cert(capsys):
+    import csv, io
+    code, out = run_cli(["analyse", str(TEST_CERTS / "withpass.p12"), "--password", "secret", "--format", "csv"], capsys)
+    assert code == 0
+    rows = list(csv.DictReader(io.StringIO(out)))
+    assert [r["subject"] for r in rows] == ["CN=test.example.com,C=US", "CN=Test CA,C=US"]
+    assert rows[0]["san"] == "DNS:test.example.com; DNS:*.example.com"
+    assert "mTLS candidate" not in out  # csv must stay machine-readable
+
+
+def test_analyse_csv_includes_expiry_warning(write_cert, capsys):
+    import csv, io
+    cert, _ = make_cert(not_after=datetime.now(timezone.utc) + timedelta(days=3, hours=1))
+    code, out = run_cli(["analyse", write_cert(cert), "--format", "csv"], capsys)
+    row = next(csv.DictReader(io.StringIO(out)))
+    assert row["warning"].startswith("certificate expires in 3 days")
+
+
+def test_invalid_format_is_rejected(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main.main(["search", EXAMPLE_CFG, "--format", "json"])
+    assert exc.value.code == 2
+
+
 # --- csr ------------------------------------------------------------------------
 
 def test_csr_writes_csr_and_key(tmp_path, capsys):

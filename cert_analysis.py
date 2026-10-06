@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from cryptography import x509
 from cryptography.x509.extensions import ExtensionNotFound
+from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.primitives.serialization import pkcs12
@@ -186,8 +187,10 @@ def _extract_cert_metadata(cert, alias: str = None, now: datetime = None) -> dic
     # `now` is only overridden by tests; it defaults to the current UTC time.
     if now is None:
         now = datetime.now(timezone.utc)
+    cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     metadata = {
         "subject": cert.subject.rfc4514_string(),
+        "common_name": cn_attrs[0].value if cn_attrs else None,
         "issuer": cert.issuer.rfc4514_string(),
         "serial_number": cert.serial_number,
         "not_valid_before": cert.not_valid_before_utc.isoformat(),
@@ -284,12 +287,25 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
             raise ValueError("unsupported JKS keystore version")
         except jks.util.KeystoreException as e:
             raise ValueError(f"failed to load JKS keystore: {e}")
+        # Private key entries come first: their chain starts with the leaf (server/client)
+        # cert, which is what callers treat as "the" certificate of the keystore.
+        # The cert chain is stored in clear, so it is readable even when the key itself
+        # is protected by a different password than the store.
         metadata_list = []
+        for alias, entry in ks.entries.items():
+            if isinstance(entry, jks.PrivateKeyEntry):
+                for _cert_type, der in entry.cert_chain:
+                    cert = x509.load_der_x509_certificate(der)
+                    meta = _extract_cert_metadata(cert, alias=alias)
+                    meta["entry_type"] = "PrivateKeyEntry"
+                    metadata_list.append(meta)
         for alias, entry in ks.entries.items():
             if isinstance(entry, jks.TrustedCertEntry):
                 # jks gives raw DER bytes, parse into a cryptography cert object
                 cert = x509.load_der_x509_certificate(entry.cert)
-                metadata_list.append(_extract_cert_metadata(cert, alias=alias))
+                meta = _extract_cert_metadata(cert, alias=alias)
+                meta["entry_type"] = "TrustedCertEntry"
+                metadata_list.append(meta)
         logger.info("Certificate metadata extracted successfully")
         return metadata_list
 
@@ -330,6 +346,19 @@ def eku_inspect(metadata: dict | list[dict]) -> bool:
     return is_mtls_candidate
 
 
+# _jks_leaf_cert returns the leaf cert of the first private key entry in a JKS store.
+# Reuses cert_metadata_extract for loading, so password handling and error messages
+# are identical to `analyse`.
+def _jks_leaf_cert(data: bytes, optional_password: str):
+    jks = _load_jks()
+    cert_metadata_extract(data, "JKS", optional_password)  # validates password, raises clean errors
+    ks = jks.KeyStore.loads(data, optional_password)
+    for entry in ks.entries.values():
+        if isinstance(entry, jks.PrivateKeyEntry) and entry.cert_chain:
+            return x509.load_der_x509_certificate(entry.cert_chain[0][1])
+    raise ValueError("no private key entry found in JKS keystore (a truststore has no leaf certificate to renew)")
+
+
 # csr_generate builds a Certificate Signing Request from an existing certificate.
 # It extracts the subject (CN, OU, O, C, etc.), SANs, and all relevant extensions
 # (EKU, Key Usage, etc.) from the cert, generates a new key pair matching the original
@@ -350,6 +379,8 @@ def csr_generate(cert_data: bytes, cert_type: str, optional_password: str = None
             raise ValueError("unable to decrypt PKCS12 file, try providing a password with --password")
         if cert is None:
             raise ValueError("no certificate found in PKCS12 file")
+    elif cert_type == "JKS":
+        cert = _jks_leaf_cert(cert_data, optional_password)
     else:
         raise ValueError(f"CSR generation is not supported for {cert_type} format")
 
