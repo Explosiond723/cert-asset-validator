@@ -1,0 +1,13 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Output of `main.py csr` (written next to the input cert by default).
+# Generated private keys must never end up in the repository.
+*.csr
+*-key.pem

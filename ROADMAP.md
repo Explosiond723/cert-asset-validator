@@ -8,22 +8,34 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 ### Cert analysis library (`cert_analysis.py`) — DONE
 
-- `cert_format(data, path, optional_password)` — probes raw bytes: PEM → DER → PKCS12 → JKS
+- `cert_format(data, path, optional_password)` — probes raw bytes: PEM → DER → JKS/JCEKS (magic number) → PKCS12
 - `cert_metadata_extract(data, cert_type, optional_password)` — returns subject, issuer, serial, validity, SANs, EKU
 - `eku_inspect(metadata)` — flags mTLS candidates (serverAuth + clientAuth)
-- `_extract_cert_metadata(cert, alias)` — shared helper for consistent extraction
+- `_extract_cert_metadata(cert, alias, now)` — shared helper for consistent extraction; SANs rendered openssl-style (`DNS:`, `IP:`, `email:`, `URI:`, ...; `otherName:UPN:user@example.com`, hex for non-text otherName values), EKUs by short name (dotted OID when unknown), plus expiry fields
+- `expiry_warning(metadata, warn_days)` — one-line warning for expired, not-yet-valid, or soon-to-expire certs
+- `pyjks` is imported lazily: PEM/DER/PKCS12 analysis works without it
 
 ### YAML validation (`main.py`) — DONE
 
 - `load_config(path)` / `validate_config(cfg, cluster_names)` — validates required fields based on `certType`, validates cluster references
 - `validate_cluster(cluster)` — validates cluster definitions (name + context)
-- Argparse CLI with `validate`, `analyse`, `csr`, and `search` subcommands
+- Argparse CLI with `validate`, `analyse`, `csr`, and `search` subcommands (`build_parser()` / `main(argv)`, testable without a subprocess)
+- `cluster.py` / `live.py` are imported only when `--live` is used: offline commands do not need the `kubernetes` package.
+- `--format list|table|csv` on `search` and `analyse` (`output.py`); named `--format` because `csr --output` is the CSR file path
 - Top-level error handling with `sys.exit(1)` for clean CLI output
 - Logging with `-v`/`--verbose` flag
 
 ### Test certificates — DONE
 
-`test_certs/` contains PEM, DER, PKCS12 (with/without password), JKS, and intentionally invalid files.
+`test_certs/` contains PEM, DER, PKCS12 (with/without password), JKS, and intentionally invalid files. `withpass.p12` uses the password `secret`. The fixtures expire on 2027-02-27; date-dependent tests use generated certs instead.
+
+### Test suite (pytest) — DONE
+
+`tests/` covers format detection, metadata extraction, SAN/EKU formatting, expiry boundaries (with a fixed `now`), CSR generation (RSA + EC), JKS round-trip (generated with pyjks), and the CLI (`validate`, `search`, `analyse`, `csr`, exit codes, `--warn-days`, `-v` position). It also runs `validate`, `search`, `analyse` (PEM, DER, PKCS12) and `csr` in a subprocess with `kubernetes` and `pyjks` unavailable, and the suite itself passes without pyjks (JKS tests are skipped). Run with `python -m pytest` after `pip install -r requirements-dev.txt`.
+
+`tests/test_live.py` covers live mode against a fake `CoreV1Api` (no cluster needed): password from Secret, wrong password, 403/404/missing key/empty Secret, unreachable context, cross-check warnings, CSV output, and that passwords never reach the output.
+
+Not covered yet: a real API server. Next step: run `validate --live` / `search --live` against a local kind cluster.
 
 ---
 
@@ -125,17 +137,25 @@ rules:
 
 The tool should detect permission errors and emit clear warnings per-namespace without blocking the entire run.
 
-### CLI flags (not yet wired into argparse)
+### CLI flags — DONE (`validate`, `search`)
 
 - `--live` — opt-in to cluster connection (default is offline validation only)
 - `--context` — override the kubeconfig context for all clusters (maps to `connect(context=...)`)
 - `--kubeconfig` — path to a non-default kubeconfig file (maps to `connect(config_file=...)`)
+- `--warn-days` — expiry threshold for live checks
+
+`--context` / `--kubeconfig` without `--live` is a usage error.
+
+### What was implemented
+
+- `cluster.connect()` returns an independent `ApiClient` per context (no global config), so one run can cover several clusters; `get_secret_key(..., api)` maps 404 / 401-403 / missing key / empty Secret / network errors to `ClusterError` with messages that never contain secret data; every API call has a 15 s timeout
+- `live.py`: `ClusterClients` (one connection per context, failures cached), `inspect_asset()` (fetch keystore + truststore + passwords, analyse, cross-check certType / cn / mtls / expiry), errors collected per asset instead of aborting the run
 
 ### Security
 
 - Never print or log secret data in full
 - Passwords held in memory only during analysis, then discarded
-- `--redact` flag (default on) masks secret values in output
+- `--redact` flag (default on) masks secret values in output — not needed so far: no command prints secret values
 - Never log ServiceAccount tokens
 
 ### Testing without a cluster
@@ -174,10 +194,10 @@ python main.py search assets.yaml --namespace energia-prod --cn "api"
 - `cn` added as a required field in the asset schema to enable offline CN search
 - Compact one-line-per-asset output format: `id | cluster | namespace | cn | certType`
 
-### Search still to do
+### Search live mode — DONE
 
-- `--live` mode: fetch actual cert from cluster and match against real CN/SANs (not just YAML metadata)
-- Show actual CN, SANs, expiration when `--live` is set
+- `--live`: fetches the actual cert from the cluster and shows real CN/subject, SANs and expiry per asset
+- `--cn` with `--live` matches the YAML cn, the real CN and the SANs
 
 ---
 
@@ -247,7 +267,7 @@ Generate a Certificate Signing Request for one or more assets, reusing the exist
 
 ### What's implemented
 
-- `csr_generate(cert_data, cert_type, optional_password)` in `cert_analysis.py` — reads a cert (PEM, DER, PKCS12), generates a new key pair matching the original type/size, builds a CSR preserving the full subject and all extensions (SANs, EKU, Key Usage, etc.), skips CA-only extensions (AKI, CRL, AIA, SKI)
+- `csr_generate(cert_data, cert_type, optional_password)` in `cert_analysis.py` — reads a cert (PEM, DER, PKCS12, JKS — leaf of the first private key entry, using `--password`), generates a new key pair matching the original type/size, builds a CSR preserving the full subject and all extensions (SANs, EKU, Key Usage, etc.), skips CA-only extensions (AKI, CRL, AIA, SKI)
 - `csr` subcommand in `main.py` — `python main.py csr <cert> [--password] [--output] [--key-output]`
 - Supports RSA and EC key types
 
@@ -256,7 +276,6 @@ Generate a Certificate Signing Request for one or more assets, reusing the exist
 - Interactive subject overrides (change CN, OU, etc. before generating)
 - `--live` mode: fetch cert from cluster via asset id
 - Reuse existing private key for mTLS key continuity
-- JKS support
 
 ### CSR CLI (current)
 
@@ -371,22 +390,20 @@ python main.py discover --live --namespace energia-prod --output assets.yaml
 
 These are smaller enhancements to the existing `cert_analysis.py` that add value at any point:
 
+- ~~**JKS private key entries**~~ — DONE: `cert_metadata_extract` returns the cert chain of `PrivateKeyEntry` (leaf first, `entry_type: PrivateKeyEntry`) before `TrustedCertEntry` certs; metadata also carries `common_name`
 - ~~**PEM chain handling**~~ — DONE: `cert_metadata_extract` uses `load_pem_x509_certificates` (plural) to handle concatenated PEM chains
-- **Expiration warnings** — days remaining, flag if expired or expiring within N days
-  - **Option A: in `_extract_cert_metadata`** — compute `days_remaining` and a human-readable `expires_in` label and add them to the metadata dict. Every caller (offline `analyse`, future `--live`) gets expiration data automatically.
-  - **Option B: in `cmd_analyse` only** — compute and display expiration at print time. Simpler, but `--live` and `map` won't see it without duplicating the logic.
-  - The threshold for "expiring soon" (30 days? 60? 90?) could be hardcoded or a `--warn-days` flag.
+- ~~**Expiration warnings**~~ — DONE (option A): `_extract_cert_metadata` adds `validity_status` (`valid` / `expired` / `not_yet_valid`), `days_remaining` (counted towards zero, negative once expired, always consistent with the label) and an `expiry` label to every cert's metadata, so `--live` and `map` get it for free. The threshold is applied separately by `expiry_warning(metadata, warn_days)`; `analyse --warn-days N` (default 30, inclusive) controls it. `analyse` still exits 0 on expired certs — a `--fail-on-expiry`-style exit code for pipelines is a possible follow-up.
 - **Self-signed detection** — Subject == Issuer check
-- **JKS magic-byte check** — `0xFEEDFEED` pre-filter before full parse
-- **Cross-validation** — detected format vs declared `certType`, EKU vs `mtls` flag
+- ~~**JKS magic-byte check**~~ — DONE: `cert_format` matches `0xFEEDFEED` (JKS) / `0xCECECECE` (JCEKS) without needing pyjks or the password, so a missing or wrong password is reported as such instead of "unable to detect certificate format"
+- **Cross-validation** — PARTIAL: with `--live`, detected format vs declared `certType`, YAML `cn` vs real CN/SANs, and `mtls` without truststore are checked; EKU vs `mtls` is not (a server cert in an mTLS setup legitimately has only serverAuth)
 
 ---
 
 ## Implementation order
 
 1. **Step 1 (multi-cluster schema)** — DONE
-2. **Step 2 (cluster connectivity)** — DONE (not yet wired into CLI via `--live` flag)
-3. **Step 3 (search/query)** — DONE (offline search; `--live` mode still to do)
+2. **Step 2 (cluster connectivity)** — DONE (wired into `validate --live` and `search --live`; still to test against a real cluster, e.g. kind)
+3. **Step 3 (search/query)** — DONE (offline and `--live`)
 4. **Step 4 (cross-reference map)** — the high-value feature; depends on connectivity
 5. **Step 5 (CSR generation)** — depends on cert metadata extraction (already done) + connectivity
 6. **Step 6 (cert rotation)** — depends on cross-reference map + connectivity; the most operationally impactful feature
