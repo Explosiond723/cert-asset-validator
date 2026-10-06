@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 from datetime import datetime, timezone
 
@@ -346,87 +347,231 @@ def eku_inspect(metadata: dict | list[dict]) -> bool:
     return is_mtls_candidate
 
 
-# _jks_leaf_cert returns the leaf cert of the first private key entry in a JKS store.
-# Reuses cert_metadata_extract for loading, so password handling and error messages
-# are identical to `analyse`.
-def _jks_leaf_cert(data: bytes, optional_password: str):
+# _load_jks_leaf returns (leaf cert, private key or None) from the first private key entry
+# of a JKS store. Reuses cert_metadata_extract for loading, so password handling and
+# error messages are identical to `analyse`. The key is None when it is protected by a
+# password different from the store password (pyjks only tries the store password).
+def _load_jks_leaf(data: bytes, optional_password: str):
     jks = _load_jks()
     cert_metadata_extract(data, "JKS", optional_password)  # validates password, raises clean errors
     ks = jks.KeyStore.loads(data, optional_password)
     for entry in ks.entries.values():
         if isinstance(entry, jks.PrivateKeyEntry) and entry.cert_chain:
-            return x509.load_der_x509_certificate(entry.cert_chain[0][1])
+            cert = x509.load_der_x509_certificate(entry.cert_chain[0][1])
+            key = None
+            if entry.is_decrypted():
+                key = serialization.load_der_private_key(entry.pkey_pkcs8, password=None)
+            return cert, key
     raise ValueError("no private key entry found in JKS keystore (a truststore has no leaf certificate to renew)")
 
 
-# csr_generate builds a Certificate Signing Request from an existing certificate.
-# It extracts the subject (CN, OU, O, C, etc.), SANs, and all relevant extensions
-# (EKU, Key Usage, etc.) from the cert, generates a new key pair matching the original
-# key type (RSA or EC), and signs the CSR.
-# Returns a tuple of (csr_pem_bytes, key_pem_bytes).
-def csr_generate(cert_data: bytes, cert_type: str, optional_password: str = None) -> tuple[bytes, bytes]:
-    # Load the first/leaf certificate depending on format
+# load_leaf_and_key returns (leaf certificate, its private key or None) from cert material
+# in any supported format. The key is only available when the material contains it:
+# PKCS12, JKS private key entries, or a PEM bundle with a PRIVATE KEY block.
+def load_leaf_and_key(data: bytes, cert_type: str, optional_password: str = None):
     if cert_type == "PEM":
-        cert = x509.load_pem_x509_certificates(cert_data)[0]
-    elif cert_type == "DER":
-        cert = x509.load_der_x509_certificate(cert_data)
-    elif cert_type == "PKCS12":
+        cert = x509.load_pem_x509_certificates(data)[0]
+        key = None
+        if b"PRIVATE KEY-----" in data:
+            try:
+                key = serialization.load_pem_private_key(
+                    data, optional_password.encode() if optional_password else None
+                )
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"unable to load the private key in the PEM file: {e}")
+        return cert, key
+    if cert_type == "DER":
+        return x509.load_der_x509_certificate(data), None
+    if cert_type == "PKCS12":
         try:
-            _key, cert, _ca_certs = pkcs12.load_key_and_certificates(
-                cert_data, optional_password.encode() if optional_password else None
+            key, cert, _ca_certs = pkcs12.load_key_and_certificates(
+                data, optional_password.encode() if optional_password else None
             )
         except ValueError:
             raise ValueError("unable to decrypt PKCS12 file, try providing a password with --password")
         if cert is None:
             raise ValueError("no certificate found in PKCS12 file")
-    elif cert_type == "JKS":
-        cert = _jks_leaf_cert(cert_data, optional_password)
-    else:
-        raise ValueError(f"CSR generation is not supported for {cert_type} format")
+        return cert, key
+    if cert_type == "JKS":
+        return _load_jks_leaf(data, optional_password)
+    raise ValueError(f"CSR generation is not supported for {cert_type} format")
 
-    # Detect original key type and size to generate a matching key
+
+# parse_san turns "DNS:x", "IP:1.2.3.4", "email:a@b", "URI:..." (the same notation
+# `analyse` prints) into a cryptography GeneralName.
+def parse_san(text: str):
+    kind, sep, value = text.partition(":")
+    if not sep or not value:
+        raise ValueError(f"invalid SAN '{text}', expected TYPE:value (DNS, IP, email, URI)")
+    kind = kind.strip().lower()
+    value = value.strip()
+    if kind == "dns":
+        return x509.DNSName(value)
+    if kind == "ip":
+        try:
+            return x509.IPAddress(ipaddress.ip_address(value))
+        except ValueError:
+            raise ValueError(f"invalid IP address in SAN '{text}'")
+    if kind == "email":
+        return x509.RFC822Name(value)
+    if kind == "uri":
+        return x509.UniformResourceIdentifier(value)
+    raise ValueError(f"unsupported SAN type in '{text}', use DNS, IP, email or URI")
+
+
+def _common_name(name: x509.Name):
+    attrs = name.get_attributes_for_oid(NameOID.COMMON_NAME)
+    return attrs[0].value if attrs else None
+
+
+# _new_subject applies --subject (full RFC 4514 replacement, e.g. "CN=a.example.com,O=Org")
+# or --cn (replace only the CN, keep O/OU/C/...) to the current subject.
+def _new_subject(current: x509.Name, subject: str = None, cn: str = None) -> x509.Name:
+    if subject and cn:
+        raise ValueError("use either a full subject or a new CN, not both")
+    if subject:
+        try:
+            return x509.Name.from_rfc4514_string(subject)
+        except ValueError:
+            raise ValueError(f"invalid subject '{subject}', expected RFC 4514 form like \"CN=api.example.com,O=Org,C=IT\"")
+    if cn:
+        # replace the CN in place: the order of the RDNs is part of the subject, and some
+        # CAs reject or re-key a request whose DN order differs from the existing cert
+        new_attr = x509.NameAttribute(NameOID.COMMON_NAME, cn)
+        if not current.get_attributes_for_oid(NameOID.COMMON_NAME):
+            return x509.Name(list(current) + [new_attr])
+        return x509.Name([new_attr if a.oid == NameOID.COMMON_NAME else a for a in current])
+    return current
+
+
+# _new_sans computes the SAN list of the CSR from the certificate's current SANs:
+#   1. if the CN changes and the old CN is a DNS SAN, that entry becomes the new CN
+#      (clients validate SANs, not the CN: renaming only the CN would be useless)
+#   2. remove_sans entries are dropped (must exist, same notation as `analyse`)
+#   3. add_sans entries are appended (duplicates ignored)
+def _new_sans(cert, old_cn: str, new_cn: str, add_sans=(), remove_sans=()) -> list:
+    try:
+        sans = list(cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value)
+    except ExtensionNotFound:
+        sans = []
+
+    if new_cn and old_cn and new_cn != old_cn:
+        sans = [x509.DNSName(new_cn) if s == x509.DNSName(old_cn) else s for s in sans]
+
+    for text in remove_sans:
+        target = parse_san(text)
+        if target not in sans:
+            current = ", ".join(_format_general_name(s) for s in sans) or "none"
+            raise ValueError(f"SAN '{text}' is not in the certificate (current SANs: {current})")
+        sans = [s for s in sans if s != target]
+
+    for text in add_sans:
+        san = parse_san(text)
+        if san not in sans:
+            sans.append(san)
+    return sans
+
+
+def _same_public_key(key, cert) -> bool:
+    fmt = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return key.public_key().public_bytes(*fmt) == cert.public_key().public_bytes(*fmt)
+
+
+def _generate_matching_key(cert):
     pub_key = cert.public_key()
     if isinstance(pub_key, rsa.RSAPublicKey):
-        key_size = pub_key.key_size
-        private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
-        logger.info("Generated new RSA-%d key", key_size)
-    elif isinstance(pub_key, ec.EllipticCurvePublicKey):
-        curve = pub_key.curve
-        private_key = ec.generate_private_key(curve)
-        logger.info("Generated new EC key (curve: %s)", curve.name)
-    else:
-        raise ValueError(f"unsupported key type: {type(pub_key).__name__}")
+        logger.info("Generated new RSA-%d key", pub_key.key_size)
+        return rsa.generate_private_key(public_exponent=65537, key_size=pub_key.key_size)
+    if isinstance(pub_key, ec.EllipticCurvePublicKey):
+        logger.info("Generated new EC key (curve: %s)", pub_key.curve.name)
+        return ec.generate_private_key(pub_key.curve)
+    raise ValueError(f"unsupported key type: {type(pub_key).__name__}")
 
-    # Build the CSR with the same subject as the original cert.
-    # subject_name() copies the full subject including CN, OU, O, C, ST, L, etc.
-    builder = x509.CertificateSigningRequestBuilder()
-    builder = builder.subject_name(cert.subject)
 
-    # Copy all extensions from the original cert into the CSR.
-    # This preserves SANs, EKU (serverAuth/clientAuth for mTLS), Key Usage,
+# build_csr creates a CSR for `cert`, optionally with a changed subject/SANs.
+# private_key: reuse this key (must be the cert's own key pair) instead of generating a
+# new one of the same type and size. Returns (csr_pem, key_pem); key_pem is None when the
+# key is reused, so an existing private key is never copied to a new file.
+def build_csr(cert, private_key=None, subject: str = None, cn: str = None,
+              add_sans=(), remove_sans=()) -> tuple[bytes, bytes | None]:
+    if private_key is not None and not _same_public_key(private_key, cert):
+        raise ValueError("the private key does not belong to this certificate")
+
+    new_name = _new_subject(cert.subject, subject, cn)
+    sans = _new_sans(cert, _common_name(cert.subject), _common_name(new_name), add_sans, remove_sans)
+
+    builder = x509.CertificateSigningRequestBuilder().subject_name(new_name)
+    if sans:
+        builder = builder.add_extension(x509.SubjectAlternativeName(sans), critical=False)
+
+    # Copy all other extensions from the original cert into the CSR.
+    # This preserves EKU (serverAuth/clientAuth for mTLS), Key Usage,
     # Basic Constraints, and any other extensions the CA included.
     # We skip Authority-related extensions (AKI, CRL, AIA, SKI) since those are
-    # set by the CA when it signs, not by the CSR requestor.
-    ca_only_extensions = (
+    # set by the CA when it signs, not by the CSR requestor. SANs were handled above.
+    skipped = (
         x509.AuthorityKeyIdentifier,
         x509.CRLDistributionPoints,
         x509.AuthorityInformationAccess,
         x509.SubjectKeyIdentifier,
+        x509.SubjectAlternativeName,
     )
     for ext in cert.extensions:
-        if isinstance(ext.value, ca_only_extensions):
+        if isinstance(ext.value, skipped):
             continue
         builder = builder.add_extension(ext.value, critical=ext.critical)
         logger.info("Copied extension: %s (critical=%s)", ext.oid._name, ext.critical)
 
+    key_pem = None
+    if private_key is None:
+        private_key = _generate_matching_key(cert)
+        key_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    else:
+        logger.info("Reusing the existing private key")
+
     csr = builder.sign(private_key, hashes.SHA256())
-
-    csr_pem = csr.public_bytes(serialization.Encoding.PEM)
-    key_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-
     logger.info("CSR generated successfully")
-    return csr_pem, key_pem
+    return csr.public_bytes(serialization.Encoding.PEM), key_pem
+
+
+# csr_generate builds a Certificate Signing Request from existing certificate material.
+# By default it keeps the subject, SANs and extensions and generates a new key pair of the
+# same type and size. Optional changes:
+#   subject / cn:            new full subject, or only a new CN
+#   add_sans / remove_sans:  SAN edits ("DNS:x", "IP:1.2.3.4", ...)
+#   reuse_key:               sign with the key contained in the material (PKCS12, JKS,
+#                            PEM bundle with key) instead of generating a new one
+#   private_key_pem:         sign with this PEM key (e.g. the current tls.key); key_password
+#                            decrypts it if encrypted
+# Returns (csr_pem, key_pem); key_pem is None when an existing key is reused.
+def csr_generate(cert_data: bytes, cert_type: str, optional_password: str = None, *,
+                 subject: str = None, cn: str = None, add_sans=(), remove_sans=(),
+                 reuse_key: bool = False, private_key_pem: bytes = None,
+                 key_password: str = None) -> tuple[bytes, bytes | None]:
+    if reuse_key and private_key_pem is not None:
+        raise ValueError("use either the key contained in the keystore or a separate key file, not both")
+
+    cert, embedded_key = load_leaf_and_key(cert_data, cert_type, optional_password)
+
+    private_key = None
+    if private_key_pem is not None:
+        try:
+            private_key = serialization.load_pem_private_key(
+                private_key_pem, key_password.encode() if key_password else None
+            )
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"unable to load the private key file: {e}")
+    elif reuse_key:
+        if embedded_key is None:
+            if cert_type == "JKS":
+                raise ValueError("the JKS private key is protected by a password different from the "
+                                 "store password, which is not supported")
+            raise ValueError(f"no private key found in the {cert_type} material, "
+                             "pass the existing key file with --key instead")
+        private_key = embedded_key
+
+    return build_csr(cert, private_key, subject=subject, cn=cn, add_sans=add_sans, remove_sans=remove_sans)

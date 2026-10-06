@@ -21,7 +21,7 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 - `validate_cluster(cluster)` — validates cluster definitions (name + context)
 - Argparse CLI with `validate`, `analyse`, `csr`, and `search` subcommands (`build_parser()` / `main(argv)`, testable without a subprocess)
 - `cluster.py` / `live.py` are imported only when `--live` is used: offline commands do not need the `kubernetes` package.
-- `--format list|table|csv` on `search` and `analyse` (`output.py`); named `--format` because `csr --output` is the CSR file path
+- `--format list|table|csv` on `validate`, `search` and `analyse` (`output.py`); named `--format` because `csr --output` is the CSR file path
 - Top-level error handling with `sys.exit(1)` for clean CLI output
 - Logging with `-v`/`--verbose` flag
 
@@ -35,7 +35,7 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 `tests/test_live.py` covers live mode against a fake `CoreV1Api` (no cluster needed): password from Secret, wrong password, 403/404/missing key/empty Secret, unreachable context, cross-check warnings, CSV output, and that passwords never reach the output.
 
-Not covered yet: a real API server. Next step: run `validate --live` / `search --live` against a local kind cluster.
+A real API server is covered by `e2e/kind.sh` (kind cluster, run manually; see README).
 
 ---
 
@@ -261,21 +261,22 @@ python main.py map assets.yaml --live --cn "energia-api.example.com"
 
 ---
 
-## Step 5: CSR generation — PARTIAL
+## Step 5: CSR generation — DONE
 
 Generate a Certificate Signing Request for one or more assets, reusing the existing cert's subject, SANs, and key type as defaults.
 
 ### What's implemented
 
-- `csr_generate(cert_data, cert_type, optional_password)` in `cert_analysis.py` — reads a cert (PEM, DER, PKCS12, JKS — leaf of the first private key entry, using `--password`), generates a new key pair matching the original type/size, builds a CSR preserving the full subject and all extensions (SANs, EKU, Key Usage, etc.), skips CA-only extensions (AKI, CRL, AIA, SKI)
-- `csr` subcommand in `main.py` — `python main.py csr <cert> [--password] [--output] [--key-output]`
-- Supports RSA and EC key types
+- `load_leaf_and_key()` reads the leaf cert and, when present, its private key (PEM, DER, PKCS12, JKS private key entry, PEM bundle with key)
+- `build_csr()` keeps the subject, SANs and all extensions (EKU, Key Usage, ...), skips CA-only extensions (AKI, CRL, AIA, SKI); generates a new RSA/EC key of the same type and size, or reuses an existing key after checking it belongs to the cert (no key file written then)
+- Subject/SAN edits (non-interactive, scriptable): `--cn` (in place, RDN order kept, matching DNS SAN renamed), `--subject` (RFC 4514), `--add-san`, `--remove-san`
+- `--live --id ASSET`: keystore and password from the asset's Secrets; `--reuse-key` on `tls.crt` assets reads `tls.key` from the same Secret
+- New private keys are written with mode 0600
 
 ### CSR still to do
 
-- Interactive subject overrides (change CN, OU, etc. before generating)
-- `--live` mode: fetch cert from cluster via asset id
-- Reuse existing private key for mTLS key continuity
+- Interactive mode (prompt for each field) — the flags above cover the scripted case
+- A JKS private key protected by a password different from the store password is not supported (pyjks only tries the store password)
 
 ### CSR CLI (current)
 
@@ -290,14 +291,14 @@ python main.py csr test_certs/full.pem --output my.csr --key-output my-key.pem
 python main.py csr keystore.p12 --password mysecret
 ```
 
-### CSR CLI (planned, requires cluster connectivity)
+### CSR CLI (live)
 
 ```bash
-# Generate CSR for a specific asset
+# Generate CSR for a specific asset, keystore and password read from the cluster
 python main.py csr assets.yaml --id energia-api --live
 
-# Non-interactive (accept all defaults)
-python main.py csr assets.yaml --id energia-api --live --defaults
+# Same, keeping the current key and renaming the CN
+python main.py csr assets.yaml --id energia-api --live --reuse-key --cn energia-api-v2.example.com
 ```
 
 ---
@@ -405,7 +406,7 @@ These are smaller enhancements to the existing `cert_analysis.py` that add value
 2. **Step 2 (cluster connectivity)** — DONE (wired into `validate --live` and `search --live`; still to test against a real cluster, e.g. kind)
 3. **Step 3 (search/query)** — DONE (offline and `--live`)
 4. **Step 4 (cross-reference map)** — the high-value feature; depends on connectivity
-5. **Step 5 (CSR generation)** — depends on cert metadata extraction (already done) + connectivity
+5. **Step 5 (CSR generation)** — DONE (file and `--live`, subject/SAN edits, key reuse)
 6. **Step 6 (cert rotation)** — depends on cross-reference map + connectivity; the most operationally impactful feature
 7. **Step 7 (auto-discovery)** — nice bootstrapping tool; depends on connectivity
 

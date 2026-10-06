@@ -51,10 +51,10 @@ class ClusterClients:
         return cached
 
 
-# _fetch_store reads one keystore/truststore reference from the cluster and parses it.
-# Returns (format, list of cert metadata). The password, if any, only lives in this
-# function's scope and is never logged or printed.
-def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
+# fetch_store_material reads one keystore/truststore reference from the cluster and
+# returns (raw bytes, password or None). The password only lives in the caller's scope
+# and is never logged or printed.
+def fetch_store_material(api, namespace: str, store: dict) -> tuple[bytes, str | None]:
     secret = store["secret"]
     data = cluster.get_secret_key(namespace, secret["name"], secret["key"], api)
 
@@ -68,6 +68,13 @@ def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
             password = raw.decode("utf-8").rstrip("\r\n")
         except UnicodeDecodeError:
             raise ValueError(f"password in Secret '{ref['name']}' key '{ref['key']}' is not valid UTF-8")
+    return data, password
+
+
+# _fetch_store fetches a store and parses it. Returns (format, list of cert metadata).
+def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
+    secret = store["secret"]
+    data, password = fetch_store_material(api, namespace, store)
 
     fmt = cert_format(data, secret["key"], password)
     if fmt is None:
@@ -78,6 +85,27 @@ def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
     if not metas:
         raise ValueError(f"no certificates found in Secret '{secret['name']}' key '{secret['key']}'")
     return fmt, metas
+
+
+# fetch_csr_material gets what `csr --live` needs for an asset: the keystore bytes, its
+# detected format, the password, and (only when reuse_key is set and the cert is a PEM
+# stored as tls.crt) the PEM private key from tls.key of the same Secret, the
+# kubernetes.io/tls layout. Raises ClusterError / ValueError.
+def fetch_csr_material(asset: dict, clients: ClusterClients, reuse_key: bool):
+    store = asset.get("keystore")
+    if not isinstance(store, dict) or not isinstance(store.get("secret"), dict):
+        raise ValueError(f"asset '{asset['id']}' has no keystore.secret reference, nothing to renew")
+    api = clients.api_for(asset)
+    data, password = fetch_store_material(api, asset["namespace"], store)
+    secret = store["secret"]
+    fmt = cert_format(data, secret["key"], password)
+    if fmt is None:
+        raise ValueError(f"unable to detect certificate format of Secret '{secret['name']}' key '{secret['key']}'")
+
+    key_pem = None
+    if reuse_key and fmt in ("PEM", "DER") and secret["key"] == "tls.crt":
+        key_pem = cluster.get_secret_key(asset["namespace"], secret["name"], "tls.key", api)
+    return data, fmt, password, key_pem
 
 
 # _leaf picks the certificate that identifies the asset: the first cert of a private

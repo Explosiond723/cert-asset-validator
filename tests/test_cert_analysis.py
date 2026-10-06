@@ -283,3 +283,170 @@ def test_missing_pyjks_only_breaks_jks(monkeypatch):
     # parsing a real JKS does, and says so
     with pytest.raises(ValueError, match="pip install pyjks"):
         cert_metadata_extract(cert_analysis.JKS_MAGIC + b"rest", "JKS", "changeit")
+
+
+# --- CSR: subject/SAN edits and key reuse -----------------------------------------
+
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+
+from cert_analysis import build_csr, parse_san  # noqa: E402
+
+
+def _csr(pem: bytes):
+    return x509.load_pem_x509_csr(pem)
+
+
+def _csr_sans(csr) -> list:
+    try:
+        return list(csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value)
+    except x509.ExtensionNotFound:
+        return []
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("DNS:api.example.com", x509.DNSName("api.example.com")),
+    ("dns: api.example.com ", x509.DNSName("api.example.com")),
+    ("IP:10.0.0.5", x509.IPAddress(__import__("ipaddress").ip_address("10.0.0.5"))),
+    ("email:ops@example.com", x509.RFC822Name("ops@example.com")),
+    ("URI:spiffe://example.com/x", x509.UniformResourceIdentifier("spiffe://example.com/x")),
+])
+def test_parse_san(text, expected):
+    assert parse_san(text) == expected
+
+
+@pytest.mark.parametrize("text", ["api.example.com", "DNS:", "IP:not-an-ip", "RID:1.2.3"])
+def test_parse_san_rejects_invalid(text):
+    with pytest.raises(ValueError):
+        parse_san(text)
+
+
+@pytest.fixture
+def renewal_cert():
+    cert, key = make_cert(
+        cn="old.example.com",
+        sans=[x509.DNSName("old.example.com"), x509.DNSName("alias.example.com")],
+        ekus=[ExtendedKeyUsageOID.SERVER_AUTH],
+    )
+    return cert, key
+
+
+def test_build_csr_default_keeps_everything(renewal_cert):
+    cert, _ = renewal_cert
+    csr_pem, key_pem = build_csr(cert)
+    csr = _csr(csr_pem)
+    assert csr.subject == cert.subject
+    assert _csr_sans(csr) == [x509.DNSName("old.example.com"), x509.DNSName("alias.example.com")]
+    assert key_pem is not None
+
+
+def test_build_csr_new_cn_renames_matching_san_and_keeps_rest_of_subject(renewal_cert):
+    cert, _ = renewal_cert
+    csr = _csr(build_csr(cert, cn="new.example.com")[0])
+    assert csr.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0].value == "new.example.com"
+    assert csr.subject.get_attributes_for_oid(x509.oid.NameOID.ORGANIZATION_NAME)[0].value == "Test Org"
+    assert _csr_sans(csr) == [x509.DNSName("new.example.com"), x509.DNSName("alias.example.com")]
+    # EKU is still copied
+    assert csr.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
+
+
+def test_build_csr_new_cn_keeps_rdn_order():
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import NameOID
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "IT"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Acme"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "old.example.com"),
+    ])
+    now = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
+            .public_key(key.public_key()).serial_number(1)
+            .not_valid_before(now).not_valid_after(now + timedelta(days=1))
+            .sign(key, hashes.SHA256()))
+    csr = _csr(build_csr(cert, cn="new.example.com")[0])
+    assert [a.value for a in csr.subject] == ["IT", "Acme", "new.example.com"]
+
+
+def test_build_csr_full_subject(renewal_cert):
+    cert, _ = renewal_cert
+    csr = _csr(build_csr(cert, subject="CN=api.example.com,OU=Ops,O=Acme,C=IT")[0])
+    assert csr.subject.rfc4514_string() == "CN=api.example.com,OU=Ops,O=Acme,C=IT"
+    assert x509.DNSName("api.example.com") in _csr_sans(csr)
+
+
+def test_build_csr_add_and_remove_sans(renewal_cert):
+    cert, _ = renewal_cert
+    csr = _csr(build_csr(cert, add_sans=["IP:10.0.0.5", "DNS:alias.example.com"],
+                         remove_sans=["DNS:alias.example.com"])[0])
+    # removals happen before additions, so the same SAN can be removed and re-added
+    assert [str(s.value) for s in _csr_sans(csr)] == ["old.example.com", "10.0.0.5", "alias.example.com"]
+
+
+def test_build_csr_removing_all_sans_drops_the_extension(renewal_cert):
+    cert, _ = renewal_cert
+    csr = _csr(build_csr(cert, remove_sans=["DNS:old.example.com", "DNS:alias.example.com"])[0])
+    assert _csr_sans(csr) == []
+
+
+def test_build_csr_unknown_san_removal_fails(renewal_cert):
+    cert, _ = renewal_cert
+    with pytest.raises(ValueError, match="not in the certificate"):
+        build_csr(cert, remove_sans=["DNS:nope.example.com"])
+
+
+def test_build_csr_subject_and_cn_are_exclusive(renewal_cert):
+    cert, _ = renewal_cert
+    with pytest.raises(ValueError, match="not both"):
+        build_csr(cert, subject="CN=a", cn="b")
+
+
+def test_build_csr_reuses_key(renewal_cert):
+    cert, key = renewal_cert
+    csr_pem, key_pem = build_csr(cert, private_key=key)
+    assert key_pem is None
+    assert _csr(csr_pem).public_key().public_numbers() == cert.public_key().public_numbers()
+
+
+def test_build_csr_rejects_foreign_key(renewal_cert):
+    cert, _ = renewal_cert
+    _, other_key = make_cert()
+    with pytest.raises(ValueError, match="does not belong"):
+        build_csr(cert, private_key=other_key)
+
+
+def test_csr_reuse_key_from_pkcs12():
+    from cryptography.hazmat.primitives.serialization import pkcs12
+    _, cert, _ = pkcs12.load_key_and_certificates(read("withpass.p12"), b"secret")
+    csr_pem, key_pem = csr_generate(read("withpass.p12"), "PKCS12", "secret", reuse_key=True)
+    assert key_pem is None
+    assert _csr(csr_pem).public_key().public_numbers() == cert.public_key().public_numbers()
+
+
+def test_csr_reuse_key_from_jks(make_keystore):
+    data = make_keystore(leaf_cn="server.example.com")
+    leaf_pub = _csr(csr_generate(data, "JKS", "changeit", reuse_key=True)[0]).public_key()
+    fresh_pub = _csr(csr_generate(data, "JKS", "changeit")[0]).public_key()
+    assert leaf_pub.public_numbers() != fresh_pub.public_numbers()
+    metas = cert_metadata_extract(data, "JKS", "changeit")
+    assert metas[0]["common_name"] == "server.example.com"
+
+
+def test_csr_reuse_key_from_pem_bundle_and_separate_key_file():
+    cert, key = make_cert(cn="bundle.example.com")
+    key_pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                serialization.BestAvailableEncryption(b"kpass"))
+    bundle = cert_pem(cert) + key_pem
+
+    csr_pem, new_key = csr_generate(bundle, "PEM", "kpass", reuse_key=True)
+    assert new_key is None
+    assert _csr(csr_pem).public_key().public_numbers() == cert.public_key().public_numbers()
+
+    csr_pem, new_key = csr_generate(cert_pem(cert), "PEM", private_key_pem=key_pem, key_password="kpass")
+    assert new_key is None
+    with pytest.raises(ValueError, match="unable to load the private key file"):
+        csr_generate(cert_pem(cert), "PEM", private_key_pem=key_pem, key_password="wrong")
+
+
+def test_csr_reuse_key_without_key_in_material():
+    with pytest.raises(ValueError, match="--key"):
+        csr_generate(read("full.pem"), "PEM", reuse_key=True)

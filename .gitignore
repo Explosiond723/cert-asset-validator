@@ -11,3 +11,6 @@ venv/
 # Generated private keys must never end up in the repository.
 *.csr
 *-key.pem
+
+# e2e/kind.sh working directory (kubeconfig with a ServiceAccount token, generated keys)
+e2e/out/

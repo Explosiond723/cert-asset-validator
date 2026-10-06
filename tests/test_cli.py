@@ -324,6 +324,74 @@ def test_csr_writes_csr_and_key(tmp_path, capsys):
     assert b"PRIVATE KEY" in key_path.read_bytes()
 
 
+def test_csr_with_subject_changes_and_private_key_permissions(tmp_path, capsys):
+    csr_path, key_path = tmp_path / "new.csr", tmp_path / "new-key.pem"
+    code, out = run_cli([
+        "csr", str(TEST_CERTS / "withpass.p12"), "--password", "secret",
+        "--cn", "renamed.example.com", "--add-san", "IP:10.0.0.5", "--remove-san", "DNS:*.example.com",
+        "--output", str(csr_path), "--key-output", str(key_path),
+    ], capsys)
+    assert code == 0
+    from cryptography import x509
+    csr = x509.load_pem_x509_csr(csr_path.read_bytes())
+    assert "CN=renamed.example.com" in csr.subject.rfc4514_string()
+    sans = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert [str(s.value) for s in sans] == ["renamed.example.com", "10.0.0.5"]
+    assert (key_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_csr_reuse_key_writes_no_key_file(tmp_path, capsys):
+    csr_path = tmp_path / "r.csr"
+    code, out = run_cli(["csr", str(TEST_CERTS / "withpass.p12"), "--password", "secret",
+                         "--reuse-key", "--output", str(csr_path)], capsys)
+    assert code == 0
+    assert "existing key reused" in out
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["r.csr"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["csr", "x.p12", "--cn", "a", "--subject", "CN=b"],
+    ["csr", "x.p12", "--reuse-key", "--key", "k.pem"],
+    ["csr", "x.p12", "--reuse-key", "--key-output", "k.pem"],
+    ["csr", "x.p12", "--key-password", "p"],
+    ["csr", "inv.yaml", "--live"],
+    ["csr", "inv.yaml", "--id", "api"],
+    ["csr", "inv.yaml", "--id", "api", "--live", "--password", "p"],
+])
+def test_csr_usage_errors(argv):
+    with pytest.raises(SystemExit) as exc:
+        main.main(argv)
+    assert exc.value.code == 2
+
+
+# --- validate --format ----------------------------------------------------------------
+
+def test_validate_csv_includes_invalid_assets(tmp_path, capsys):
+    import csv, io
+    cfg = write_yaml(tmp_path, {
+        "clusters": [{"name": "c1", "context": "ctx"}],
+        "assets": [
+            {"id": "ok", "cluster": "c1", "namespace": "ns", "cn": "ok.example.com", "certType": "pem"},
+            {"id": "no-cn", "cluster": "c1", "namespace": "ns", "certType": "pem"},
+        ],
+    })
+    code, out = run_cli(["validate", cfg, "--format", "csv"], capsys)
+    assert code == 1
+    rows = {r["id"]: r for r in csv.DictReader(io.StringIO(out))}
+    assert rows["ok"]["valid"] == "yes" and rows["ok"]["error"] == ""
+    assert rows["no-cn"]["valid"] == "no"
+    assert rows["no-cn"]["error"] == "missing required field: cn"
+
+
+def test_validate_table(capsys):
+    code, out = run_cli(["validate", EXAMPLE_CFG, "--format", "table"], capsys)
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0].split() == ["ID", "VALID", "ERROR", "CLUSTER", "NAMESPACE", "CN", "CERTTYPE", "MTLS"]
+    assert len(lines) == 4
+    assert "Clusters defined" not in out
+
+
 # --- optional dependencies --------------------------------------------------------
 
 def run_without_modules(blocked, argv):
