@@ -51,10 +51,10 @@ class ClusterClients:
         return cached
 
 
-# _fetch_store reads one keystore/truststore reference from the cluster and parses it.
-# Returns (format, list of cert metadata). The password, if any, only lives in this
-# function's scope and is never logged or printed.
-def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
+# fetch_store_material reads one keystore/truststore reference from the cluster and
+# returns (raw bytes, password or None). The password only lives in the caller's scope
+# and is never logged or printed.
+def fetch_store_material(api, namespace: str, store: dict) -> tuple[bytes, str | None]:
     secret = store["secret"]
     data = cluster.get_secret_key(namespace, secret["name"], secret["key"], api)
 
@@ -68,6 +68,13 @@ def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
             password = raw.decode("utf-8").rstrip("\r\n")
         except UnicodeDecodeError:
             raise ValueError(f"password in Secret '{ref['name']}' key '{ref['key']}' is not valid UTF-8")
+    return data, password
+
+
+# _fetch_store fetches a store and parses it. Returns (format, list of cert metadata).
+def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
+    secret = store["secret"]
+    data, password = fetch_store_material(api, namespace, store)
 
     fmt = cert_format(data, secret["key"], password)
     if fmt is None:
@@ -78,6 +85,27 @@ def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
     if not metas:
         raise ValueError(f"no certificates found in Secret '{secret['name']}' key '{secret['key']}'")
     return fmt, metas
+
+
+# fetch_csr_material gets what `csr --live` needs for an asset: the keystore bytes, its
+# detected format, the password, and (only when reuse_key is set and the cert is a PEM
+# stored as tls.crt) the PEM private key from tls.key of the same Secret, the
+# kubernetes.io/tls layout. Raises ClusterError / ValueError.
+def fetch_csr_material(asset: dict, clients: ClusterClients, reuse_key: bool):
+    store = asset.get("keystore")
+    if not isinstance(store, dict) or not isinstance(store.get("secret"), dict):
+        raise ValueError(f"asset '{asset['id']}' has no keystore.secret reference, nothing to renew")
+    api = clients.api_for(asset)
+    data, password = fetch_store_material(api, asset["namespace"], store)
+    secret = store["secret"]
+    fmt = cert_format(data, secret["key"], password)
+    if fmt is None:
+        raise ValueError(f"unable to detect certificate format of Secret '{secret['name']}' key '{secret['key']}'")
+
+    key_pem = None
+    if reuse_key and fmt in ("PEM", "DER") and secret["key"] == "tls.crt":
+        key_pem = cluster.get_secret_key(asset["namespace"], secret["name"], "tls.key", api)
+    return data, fmt, password, key_pem
 
 
 # _leaf picks the certificate that identifies the asset: the first cert of a private
@@ -99,9 +127,11 @@ def _cn_matches(yaml_cn: str, leaf: dict) -> bool:
 # inspect_asset fetches the asset's material from the cluster and cross-checks it
 # against the YAML. Never raises: cluster and parsing problems are collected in
 # result["errors"], inconsistencies and expiry in result["warnings"].
+# result["expiring"] is True when any keystore or truststore cert triggered an expiry
+# warning (expired, not yet valid, or within warn_days): used by --fail-on-expiry.
 def inspect_asset(asset: dict, clients: ClusterClients, warn_days: int) -> dict:
     result = {"id": asset["id"], "context": clients.context_for(asset), "errors": [], "warnings": [],
-              "keystore": None, "truststore": None, "leaf": None}
+              "expiring": False, "keystore": None, "truststore": None, "leaf": None}
     namespace = asset["namespace"]
 
     try:
@@ -125,6 +155,7 @@ def inspect_asset(asset: dict, clients: ClusterClients, warn_days: int) -> dict:
             warning = expiry_warning(meta, warn_days)
             if warning:
                 result["warnings"].append(f"{role}: {meta['subject']}: {warning}")
+                result["expiring"] = True
 
     if result["keystore"] is None and not result["errors"]:
         result["errors"].append("no keystore.secret reference in the YAML, nothing to inspect")

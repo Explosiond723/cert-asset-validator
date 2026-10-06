@@ -242,6 +242,121 @@ def test_search_live_csv_has_live_columns_and_errors(fake_cluster, capsys):
     assert "failed to load context" in rows["billing-api"]["errors"]
 
 
+def test_live_expiring_flag(make_keystore):
+    now = datetime.now(timezone.utc)
+    soon = FakeCoreV1Api({("web-prod", "web-tls"): {"tls.crt": www_pem(not_after=now + timedelta(days=5, hours=1))}})
+    later = FakeCoreV1Api({("web-prod", "web-tls"): {"tls.crt": www_pem(not_after=now + timedelta(days=400))}})
+    assert live.inspect_asset(pem_asset(), FakeClients(CONTEXTS, {"prod-ctx": soon}), 30)["expiring"] is True
+    assert live.inspect_asset(pem_asset(), FakeClients(CONTEXTS, {"prod-ctx": later}), 30)["expiring"] is False
+    # a cn mismatch is a warning, but not an expiry
+    mismatch = live.inspect_asset(pem_asset(cn="other"), FakeClients(CONTEXTS, {"prod-ctx": later}), 30)
+    assert mismatch["warnings"] and mismatch["expiring"] is False
+
+
+@pytest.fixture
+def healthy_fake_cluster(monkeypatch):
+    """Only public-web, reachable, cert valid for 10 days."""
+    now = datetime.now(timezone.utc)
+    prod = FakeCoreV1Api({("web-prod", "web-tls"): {"tls.crt": www_pem(not_after=now + timedelta(days=10, hours=1))}})
+
+    def fake_make_live_clients(args, clusters):
+        return FakeClients({c["name"]: c["context"] for c in clusters}, {"prod-ocp-admin": prod})
+
+    monkeypatch.setattr(main, "make_live_clients", fake_make_live_clients)
+
+
+@pytest.mark.parametrize("extra, expected_code", [
+    ([], 0),                                        # warning only
+    (["--fail-on-expiry"], 1),                      # 10 days left < 30
+    (["--fail-on-expiry", "--warn-days", "5"], 0),  # 10 days left > 5
+])
+@pytest.mark.parametrize("command", ["validate", "search"])
+def test_live_fail_on_expiry(healthy_fake_cluster, tmp_path, capsys, command, extra, expected_code):
+    import yaml
+    # only the healthy asset, so errors on the others do not mask the expiry exit code
+    cfg = yaml.safe_load(open(EXAMPLE_CFG))
+    cfg["assets"] = [a for a in cfg["assets"] if a["id"] == "public-web"]
+    path = tmp_path / "assets.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+
+    code, _ = run_cli([command, str(path), "--live", *extra], capsys)
+    assert code == expected_code
+
+
+def test_validate_live_csv(fake_cluster, capsys):
+    import csv, io
+    code, out = run_cli(["validate", EXAMPLE_CFG, "--live", "--format", "csv"], capsys)
+    assert code == 1
+    rows = {r["id"]: r for r in csv.DictReader(io.StringIO(out))}
+    assert rows["public-web"]["days_remaining"] == "10"
+    assert "not found" in rows["energia-api"]["errors"]
+
+
+# --- csr --live -----------------------------------------------------------------------
+
+@pytest.fixture
+def csr_cluster(monkeypatch, make_keystore, tmp_path):
+    """Inventory with a JKS asset and a kubernetes.io/tls asset, served by a fake cluster."""
+    import yaml
+    from cryptography.hazmat.primitives import serialization
+    tls_cert, tls_key = make_cert(cn="www.example.com", sans=[x509.DNSName("www.example.com")])
+    api = FakeCoreV1Api({
+        ("api-prod", "api-tls"): {"keystore.jks": make_keystore(leaf_cn="api.example.com")},
+        ("api-prod", "api-pass"): {"keystorePassword": b"changeit\n"},
+        ("web-prod", "web-tls"): {
+            "tls.crt": cert_pem(tls_cert),
+            "tls.key": tls_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                             serialization.NoEncryption()),
+        },
+    })
+    api_asset = jks_asset()
+    del api_asset["truststore"]
+    inventory = {"clusters": [{"name": "prod-ocp", "context": "prod-ctx"}], "assets": [api_asset, pem_asset()]}
+    path = tmp_path / "inv.yaml"
+    path.write_text(yaml.safe_dump(inventory))
+
+    def fake_make_live_clients(args, clusters):
+        return FakeClients({c["name"]: c["context"] for c in clusters}, {"prod-ctx": api})
+
+    monkeypatch.setattr(main, "make_live_clients", fake_make_live_clients)
+    monkeypatch.chdir(tmp_path)
+    return {"inventory": str(path), "tls_cert": tls_cert}
+
+
+def test_csr_live_jks_asset_uses_password_from_secret(csr_cluster, tmp_path, capsys):
+    code, out = run_cli(["csr", csr_cluster["inventory"], "--id", "api", "--live", "--cn", "api2.example.com"], capsys)
+    assert code == 0, out
+    csr = x509.load_pem_x509_csr((tmp_path / "api.csr").read_bytes())
+    assert "CN=api2.example.com" in csr.subject.rfc4514_string()
+    assert (tmp_path / "api-key.pem").exists()
+
+
+def test_csr_live_tls_secret_reuses_tls_key(csr_cluster, tmp_path, capsys):
+    code, out = run_cli(["csr", csr_cluster["inventory"], "--id", "web", "--live", "--reuse-key"], capsys)
+    assert code == 0, out
+    assert "existing key reused" in out
+    csr = x509.load_pem_x509_csr((tmp_path / "web.csr").read_bytes())
+    assert csr.public_key().public_numbers() == csr_cluster["tls_cert"].public_key().public_numbers()
+    assert not (tmp_path / "web-key.pem").exists()
+
+
+def test_csr_live_cluster_error_is_clean(csr_cluster, tmp_path, capsys):
+    import yaml
+    inv = yaml.safe_load(open(csr_cluster["inventory"]))
+    inv["assets"][1]["keystore"]["secret"]["name"] = "does-not-exist"
+    path = tmp_path / "inv2.yaml"
+    path.write_text(yaml.safe_dump(inv))
+    code, out = run_cli(["csr", str(path), "--id", "web", "--live"], capsys)
+    assert code == 1
+    assert out.startswith("error: web: Secret 'web-prod/does-not-exist' not found")
+
+
+def test_csr_live_unknown_asset(csr_cluster, capsys):
+    code, out = run_cli(["csr", csr_cluster["inventory"], "--id", "nope", "--live"], capsys)
+    assert code == 1
+    assert "asset 'nope' not found" in out
+
+
 def test_search_without_live_never_connects(fake_cluster, capsys):
     code, out = run_cli(["search", EXAMPLE_CFG, "--cn", "www"], capsys)
     assert code == 0

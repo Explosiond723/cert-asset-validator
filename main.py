@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import sys
 import yaml
 from cert_analysis import cert_format, cert_metadata_extract, eku_inspect, csr_generate, expiry_warning
@@ -138,6 +139,14 @@ def make_live_clients(args, clusters: list[dict]):
     return ClusterClients(contexts, kubeconfig=args.kubeconfig, context_override=args.context)
 
 
+# live_row_fields returns the columns `--live` adds to table/csv output for one asset.
+def live_row_fields(result: dict) -> dict:
+    leaf = result["leaf"] or {}
+    return {"live_subject": leaf.get("subject"), "not_valid_after": leaf.get("not_valid_after"),
+            "days_remaining": leaf.get("days_remaining"), "expiry": leaf.get("expiry"),
+            "san": leaf.get("san"), "warnings": result["warnings"], "errors": result["errors"]}
+
+
 def cmd_validate(args):
     config = load_config(args.config)
     clusters = config["clusters"]
@@ -152,20 +161,61 @@ def cmd_validate(args):
         except ValueError as ve:
             raise ValueError(f"Cluster config error: {ve}")
 
-    if clusters:
-        print(f"Clusters defined: {', '.join(cluster_names)}")
-        print("----")
-
-    # Validate each asset independently, all errors are reported before exiting
-    had_error = False
-    valid_assets = []
+    # Validate each asset independently, all errors are reported before exiting.
+    # records keeps (asset id, asset dict or None, offline validation error or None).
+    records = []
     for i, cfg in enumerate(assets):
         asset_id = cfg.get("id", f"asset[{i}]") if isinstance(cfg, dict) else f"asset[{i}]"
         try:
             validate_config(cfg, cluster_names)
+            records.append((asset_id, cfg, None))
         except ValueError as ve:
-            print(f"error: {asset_id}: {ve}")
-            had_error = True
+            records.append((asset_id, None, str(ve)))
+    had_error = any(error for _, _, error in records)
+
+    # --live: inspect the real material of every asset that passed offline validation.
+    # Each asset is checked independently; one unreachable cluster or missing Secret
+    # does not stop the others.
+    results = {}
+    if args.live:
+        from live import inspect_asset
+        valid = [cfg for _, cfg, error in records if not error]
+        if valid:
+            clients = make_live_clients(args, clusters)
+            results = {cfg["id"]: inspect_asset(cfg, clients, args.warn_days) for cfg in valid}
+    had_error = had_error or any(r["errors"] for r in results.values())
+    expiring = sum(1 for r in results.values() if r["expiring"])
+
+    if args.format == "list":
+        print_validate_list(clusters, cluster_names, records, results)
+    else:
+        rows = []
+        for asset_id, cfg, error in records:
+            cfg = cfg or {}
+            row = {"id": asset_id, "valid": "no" if error else "yes", "error": error,
+                   "cluster": cfg.get("cluster"), "namespace": cfg.get("namespace"), "cn": cfg.get("cn"),
+                   "certType": cfg.get("certType"), "mtls": cfg.get("mtls", False) if cfg else None}
+            if args.live:
+                row.update(live_row_fields(results[asset_id]) if asset_id in results else {})
+            rows.append(row)
+        columns = ["id", "valid", "error", "cluster", "namespace", "cn", "certType", "mtls"]
+        if args.live:
+            columns += ["live_subject", "not_valid_after", "days_remaining", "expiry", "san", "warnings", "errors"]
+        render_rows(rows, columns, args.format)
+
+    if had_error:
+        sys.exit(1)
+    exit_on_expiry(args, expiring, "asset(s) with certificates")
+
+
+# print_validate_list is the default human-readable layout of `validate`.
+def print_validate_list(clusters, cluster_names, records, results) -> None:
+    if clusters:
+        print(f"Clusters defined: {', '.join(cluster_names)}")
+        print("----")
+    for asset_id, cfg, error in records:
+        if error:
+            print(f"error: {asset_id}: {error}")
             continue
         print("Asset ID: ", cfg["id"])
         if "cluster" in cfg:
@@ -175,23 +225,22 @@ def cmd_validate(args):
         print("certType: ", cfg["certType"])
         print("mTLS:     ", cfg.get("mtls", False))
         print("----")
-        valid_assets.append(cfg)
-
-    # --live: inspect the real material of every asset that passed offline validation.
-    # Each asset is checked independently; one unreachable cluster or missing Secret
-    # does not stop the others.
-    if args.live and valid_assets:
-        from live import inspect_asset, print_inspection
-        clients = make_live_clients(args, clusters)
+    if results:
+        from live import print_inspection
         print("Live checks:")
         print("----")
-        for cfg in valid_assets:
-            result = inspect_asset(cfg, clients, args.warn_days)
-            print_inspection(result)
-            if result["errors"]:
-                had_error = True
+        for asset_id, cfg, error in records:
+            if asset_id in results:
+                print_inspection(results[asset_id])
 
-    if had_error:
+
+# exit_on_expiry implements --fail-on-expiry: exit 1 when `count` certificates (or assets)
+# are expired, not yet valid, or expire within --warn-days. The reason goes to stderr so
+# that --format csv output on stdout stays machine-readable.
+def exit_on_expiry(args, count: int, what: str = "certificate(s)") -> None:
+    if args.fail_on_expiry and count:
+        print(f"error: {count} {what} expired, not yet valid, or expiring within {args.warn_days} days",
+              file=sys.stderr)
         sys.exit(1)
 
 
@@ -209,6 +258,7 @@ def cmd_analyse(args):
     # normalize to list so we handle both single cert and multi-cert the same way
     if isinstance(metadata, dict):
         metadata = [metadata]
+    expiring = sum(1 for meta in metadata if expiry_warning(meta, args.warn_days))
 
     if args.format != "list":
         rows = [dict(meta, warning=expiry_warning(meta, args.warn_days)) for meta in metadata]
@@ -221,6 +271,7 @@ def cmd_analyse(args):
         if any("alias" in meta for meta in metadata):
             columns = ["alias", "entry_type"] + columns
         render_rows(rows, columns, args.format)
+        exit_on_expiry(args, expiring)
         return
 
     for cert_meta in metadata:
@@ -236,30 +287,77 @@ def cmd_analyse(args):
 
     is_mtls = eku_inspect(metadata)
     print(f"mTLS candidate: {is_mtls}")
+    exit_on_expiry(args, expiring)
 
 
+# find_asset loads and validates an inventory and returns (asset with that id, clusters).
+def find_asset(config_path: str, asset_id: str) -> tuple[dict, list[dict]]:
+    cfg = load_config(config_path)
+    clusters = cfg["clusters"]
+    for cluster_def in clusters:
+        validate_cluster(cluster_def)
+    cluster_names = [c["name"] for c in clusters]
+    for asset in cfg["assets"]:
+        if isinstance(asset, dict) and asset.get("id") == asset_id:
+            validate_config(asset, cluster_names)
+            return asset, clusters
+    raise ValueError(f"asset '{asset_id}' not found in {config_path}")
+
+
+# cmd_csr generates a CSR either from a local file (`csr cert.pem`) or, with --live,
+# from an asset of the inventory (`csr inventory.yaml --id api --live`): the keystore and
+# its password are read from the asset's Secrets, exactly like `validate --live`.
 def cmd_csr(args):
-    with open(args.cert, "rb") as f:
-        data = f.read()
-    password = args.password
-    detected_type = cert_format(data, args.cert, password)
-    if detected_type is None:
-        print("error: unable to detect certificate format")
-        sys.exit(1)
+    key_file_pem = None
+    if args.key:
+        with open(args.key, "rb") as f:
+            key_file_pem = f.read()
 
-    csr_pem, key_pem = csr_generate(data, detected_type, password)
+    if args.live:
+        import cluster
+        from live import fetch_csr_material
+        asset, clusters = find_asset(args.source, args.id)
+        clients = make_live_clients(args, clusters)
+        try:
+            data, detected_type, password, tls_key_pem = fetch_csr_material(asset, clients, args.reuse_key)
+        except cluster.ClusterError as e:
+            # same clean one-line error as every other failure (main() handles ValueError)
+            raise ValueError(f"{asset['id']}: {e}")
+        # kubernetes.io/tls layout: the key lives in tls.key, next to tls.crt
+        reuse_key = args.reuse_key and tls_key_pem is None
+        if tls_key_pem is not None:
+            key_file_pem = tls_key_pem
+        default_base = asset["id"]
+    else:
+        with open(args.source, "rb") as f:
+            data = f.read()
+        password = args.password
+        detected_type = cert_format(data, args.source, password)
+        if detected_type is None:
+            print("error: unable to detect certificate format")
+            sys.exit(1)
+        reuse_key = args.reuse_key
+        default_base = args.source.rsplit(".", 1)[0]
 
-    # Default output filenames based on the input cert name
-    cert_base = args.cert.rsplit(".", 1)[0]
-    csr_path = args.output or f"{cert_base}.csr"
-    key_path = args.key_output or f"{cert_base}-key.pem"
+    csr_pem, key_pem = csr_generate(
+        data, detected_type, password,
+        subject=args.subject, cn=args.cn, add_sans=args.add_san or (), remove_sans=args.remove_san or (),
+        reuse_key=reuse_key, private_key_pem=key_file_pem, key_password=args.key_password,
+    )
 
+    csr_path = args.output or f"{default_base}.csr"
     with open(csr_path, "wb") as f:
         f.write(csr_pem)
-    with open(key_path, "wb") as f:
-        f.write(key_pem)
-
     print(f"CSR written to: {csr_path}")
+
+    if key_pem is None:
+        print("Private key: existing key reused, no new key written")
+        return
+    key_path = args.key_output or f"{default_base}-key.pem"
+    # the new private key is created readable by the owner only
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(key_pem)
     print(f"Private key written to: {key_path}")
 
 # cmd_search is a simple filter that loads the YAML config and prints assets that match the provided filters.
@@ -297,6 +395,7 @@ def cmd_search(args):
         assets = [a for a in assets if args.cn in a["cn"]]
 
     had_error = any(results[a["id"]]["errors"] for a in assets) if args.live else False
+    expiring = sum(1 for a in assets if results[a["id"]]["expiring"]) if args.live else 0
 
     if args.format != "list":
         rows = []
@@ -304,16 +403,13 @@ def cmd_search(args):
             row = {"id": asset["id"], "cluster": asset.get("cluster", ""), "namespace": asset["namespace"],
                    "cn": asset["cn"], "certType": asset["certType"]}
             if args.live:
-                result = results[asset["id"]]
-                leaf = result["leaf"] or {}
-                row.update({"live_subject": leaf.get("subject"), "not_valid_after": leaf.get("not_valid_after"),
-                            "days_remaining": leaf.get("days_remaining"), "expiry": leaf.get("expiry"),
-                            "san": leaf.get("san"), "warnings": result["warnings"], "errors": result["errors"]})
+                row.update(live_row_fields(results[asset["id"]]))
             rows.append(row)
         columns = list(rows[0].keys()) if rows else ["id", "cluster", "namespace", "cn", "certType"]
         render_rows(rows, columns, args.format)
         if had_error:
             sys.exit(1)
+        exit_on_expiry(args, expiring, "asset(s) with certificates")
         return
 
     print(f"Found {len(assets)} matching assets:")
@@ -334,8 +430,7 @@ def cmd_search(args):
 
     if had_error:
         sys.exit(1)
-
-
+    exit_on_expiry(args, expiring, "asset(s) with certificates")
 
 
 # non_negative_int is an argparse type: rejects negative values for day thresholds.
@@ -356,16 +451,28 @@ def add_format_argument(subparser: argparse.ArgumentParser) -> None:
                            help="Output format: list (default, human-readable), table, or csv")
 
 
+# add_fail_on_expiry_argument adds --fail-on-expiry, the pipeline-friendly counterpart
+# of the WARNING lines (same idea as `openssl x509 -checkend`).
+def add_fail_on_expiry_argument(subparser: argparse.ArgumentParser, note: str = None) -> None:
+    help_text = "Exit with status 1 if a certificate is expired, not yet valid, or expires within --warn-days"
+    if note:
+        help_text += f" ({note})"
+    subparser.add_argument("--fail-on-expiry", action="store_true", help=help_text)
+
+
 # add_live_arguments adds the cluster-access flags shared by the inventory commands.
-def add_live_arguments(subparser: argparse.ArgumentParser) -> None:
+def add_live_arguments(subparser: argparse.ArgumentParser, expiry: bool = True) -> None:
     subparser.add_argument("--live", action="store_true",
                            help="Connect to the clusters and inspect the real certificates (read-only)")
     subparser.add_argument("--context", help="Use this kubeconfig context for all clusters (requires --live)")
     subparser.add_argument("--kubeconfig", metavar="PATH", help="Path to a kubeconfig file (requires --live)")
+    if not expiry:
+        return
     subparser.add_argument(
         "--warn-days", type=non_negative_int, default=30, metavar="DAYS",
         help="With --live, warn when a certificate expires within DAYS days (default: 30)",
     )
+    add_fail_on_expiry_argument(subparser, "requires --live")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -381,6 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate", help="Validate YAML asset definitions")
     validate_parser.add_argument("config", metavar="CONFIGFILE", help="Path to YAML config file")
     add_live_arguments(validate_parser)
+    add_format_argument(validate_parser)
     validate_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
     # `python main.py analyse <cert> [--password] [--warn-days]` — takes the cert path as positional,
@@ -392,17 +500,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--warn-days", type=non_negative_int, default=30, metavar="DAYS",
         help="Warn when a certificate expires within DAYS days (default: 30)",
     )
+    add_fail_on_expiry_argument(analyse_parser)
     add_format_argument(analyse_parser)
     analyse_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
 
-    # `python main.py csr <cert> [--password] [--output] [--key-output]`
-    # Generates a CSR from an existing certificate, reusing its subject, SANs, and extensions
+    # `python main.py csr <cert> [...]` or `python main.py csr <config> --id ASSET --live [...]`
+    # Generates a CSR from an existing certificate, reusing its subject, SANs, and extensions.
+    # Subject/SANs can be changed and the existing key reused instead of generating a new one.
     csr_parser = subparsers.add_parser("csr", help="Generate a CSR from an existing certificate")
-    csr_parser.add_argument("cert", metavar="FILE", help="Path to certificate file")
-    csr_parser.add_argument("--password", help="Password for PKCS12/JKS keystores")
-    csr_parser.add_argument("--output", help="Output path for the CSR file (default: <cert>.csr)")
-    csr_parser.add_argument("--key-output", help="Output path for the private key (default: <cert>-key.pem)")
+    csr_parser.add_argument("source", metavar="FILE",
+                            help="Certificate/keystore file, or the YAML inventory with --id and --live")
+    csr_parser.add_argument("--id", metavar="ASSET", help="Asset id in the inventory (requires --live)")
+    csr_parser.add_argument("--password", help="Password for PKCS12/JKS keystores (with --live it comes from passwordRef)")
+    csr_parser.add_argument("--output", help="Output path for the CSR file (default: <cert>.csr, or <asset-id>.csr)")
+    csr_parser.add_argument("--key-output", help="Output path for the new private key (default: <cert>-key.pem, or <asset-id>-key.pem)")
+    subject_group = csr_parser.add_mutually_exclusive_group()
+    subject_group.add_argument("--cn", help="New Common Name; the rest of the subject is kept, and a DNS SAN equal to the old CN is renamed too")
+    subject_group.add_argument("--subject", help='New full subject in RFC 4514 form, e.g. "CN=api.example.com,O=Org,C=IT"')
+    csr_parser.add_argument("--add-san", action="append", metavar="SAN",
+                            help="Add a SAN, e.g. DNS:api2.example.com or IP:10.0.0.5 (repeatable)")
+    csr_parser.add_argument("--remove-san", action="append", metavar="SAN",
+                            help="Remove a SAN, in the notation shown by `analyse` (repeatable)")
+    key_group = csr_parser.add_mutually_exclusive_group()
+    key_group.add_argument("--reuse-key", action="store_true",
+                           help="Sign with the existing private key from the keystore (PKCS12, JKS, PEM bundle, "
+                                "or tls.key with --live) instead of generating a new one")
+    key_group.add_argument("--key", metavar="KEYFILE", help="Sign with this existing PEM private key")
+    csr_parser.add_argument("--key-password", help="Password of an encrypted --key file")
+    add_live_arguments(csr_parser, expiry=False)
     csr_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
     # `python main.py search <config> [--namespace] [--cluster] [--secret] [--cn]`
@@ -452,6 +578,19 @@ def main(argv: list[str] = None) -> None:
 
     if not getattr(args, "live", False) and (getattr(args, "context", None) or getattr(args, "kubeconfig", None)):
         parser.error("--context and --kubeconfig require --live")
+    if args.command == "csr":
+        if args.live and not args.id:
+            parser.error("csr --live requires --id ASSET")
+        if args.id and not args.live:
+            parser.error("--id requires --live")
+        if args.live and args.password:
+            parser.error("with --live the password is read from the asset's passwordRef, do not pass --password")
+        if args.key_output and (args.reuse_key or args.key):
+            parser.error("--key-output is not used when an existing key is reused")
+        if args.key_password and not args.key:
+            parser.error("--key-password requires --key")
+    if args.command in ("validate", "search") and args.fail_on_expiry and not args.live:
+        parser.error("--fail-on-expiry requires --live for validate and search (the YAML holds no certificate data)")
 
     # Top-level error handling: catch ValueErrors raised by subcommands and
     # print a clean one-line message instead of a full Python traceback.

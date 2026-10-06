@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 import main
-from conftest import REPO_ROOT, TEST_CERTS, make_cert
+from conftest import REPO_ROOT, TEST_CERTS, cert_pem, make_cert
 
 EXAMPLE_CFG = str(REPO_ROOT / "example-cfg.yaml")
 
@@ -211,6 +211,53 @@ def test_analyse_jks_password_errors_reach_the_cli(make_keystore, tmp_path, caps
     assert "  alias: my-ca" in out
 
 
+# --- --fail-on-expiry -----------------------------------------------------------------
+
+@pytest.mark.parametrize("days_left, extra, expected_code", [
+    (400, [], 0),                         # healthy cert: never fails
+    (10, [], 0),                          # warning only, flag not given: exit code unchanged
+    (10, ["--fail-on-expiry"], 1),
+    (10, ["--fail-on-expiry", "--warn-days", "5"], 0),
+    (-3, ["--fail-on-expiry"], 1),        # already expired
+])
+def test_analyse_fail_on_expiry(write_cert, capsys, days_left, extra, expected_code):
+    now = datetime.now(timezone.utc)
+    cert, _ = make_cert(not_before=now - timedelta(days=30), not_after=now + timedelta(days=days_left, hours=1))
+    code, _ = run_cli(["analyse", write_cert(cert), *extra], capsys)
+    assert code == expected_code
+
+
+def test_analyse_fail_on_expiry_counts_any_cert_in_chain(tmp_path, capsys):
+    now = datetime.now(timezone.utc)
+    leaf, _ = make_cert(cn="leaf", not_after=now + timedelta(days=400))
+    ca, _ = make_cert(cn="ca", not_after=now + timedelta(days=2, hours=1))
+    path = tmp_path / "chain.pem"
+    path.write_bytes(cert_pem(leaf) + cert_pem(ca))
+    code, _ = run_cli(["analyse", str(path), "--fail-on-expiry"], capsys)
+    assert code == 1
+
+
+def test_analyse_fail_on_expiry_keeps_csv_stdout_clean(write_cert, capsys):
+    import csv, io
+    cert, _ = make_cert(not_after=datetime.now(timezone.utc) + timedelta(days=3, hours=1))
+    try:
+        main.main(["analyse", write_cert(cert), "--format", "csv", "--fail-on-expiry"])
+        code = 0
+    except SystemExit as e:
+        code = e.code
+    captured = capsys.readouterr()
+    assert code == 1
+    assert len(list(csv.DictReader(io.StringIO(captured.out)))) == 1
+    assert "expiring within 30 days" in captured.err
+
+
+@pytest.mark.parametrize("command", ["validate", "search"])
+def test_fail_on_expiry_requires_live_for_inventory_commands(command):
+    with pytest.raises(SystemExit) as exc:
+        main.main([command, EXAMPLE_CFG, "--fail-on-expiry"])
+    assert exc.value.code == 2
+
+
 # --- --format ---------------------------------------------------------------------
 
 def test_search_csv_is_parseable(capsys):
@@ -275,6 +322,74 @@ def test_csr_writes_csr_and_key(tmp_path, capsys):
     assert code == 0
     assert csr_path.read_bytes().startswith(b"-----BEGIN CERTIFICATE REQUEST-----")
     assert b"PRIVATE KEY" in key_path.read_bytes()
+
+
+def test_csr_with_subject_changes_and_private_key_permissions(tmp_path, capsys):
+    csr_path, key_path = tmp_path / "new.csr", tmp_path / "new-key.pem"
+    code, out = run_cli([
+        "csr", str(TEST_CERTS / "withpass.p12"), "--password", "secret",
+        "--cn", "renamed.example.com", "--add-san", "IP:10.0.0.5", "--remove-san", "DNS:*.example.com",
+        "--output", str(csr_path), "--key-output", str(key_path),
+    ], capsys)
+    assert code == 0
+    from cryptography import x509
+    csr = x509.load_pem_x509_csr(csr_path.read_bytes())
+    assert "CN=renamed.example.com" in csr.subject.rfc4514_string()
+    sans = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert [str(s.value) for s in sans] == ["renamed.example.com", "10.0.0.5"]
+    assert (key_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_csr_reuse_key_writes_no_key_file(tmp_path, capsys):
+    csr_path = tmp_path / "r.csr"
+    code, out = run_cli(["csr", str(TEST_CERTS / "withpass.p12"), "--password", "secret",
+                         "--reuse-key", "--output", str(csr_path)], capsys)
+    assert code == 0
+    assert "existing key reused" in out
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["r.csr"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["csr", "x.p12", "--cn", "a", "--subject", "CN=b"],
+    ["csr", "x.p12", "--reuse-key", "--key", "k.pem"],
+    ["csr", "x.p12", "--reuse-key", "--key-output", "k.pem"],
+    ["csr", "x.p12", "--key-password", "p"],
+    ["csr", "inv.yaml", "--live"],
+    ["csr", "inv.yaml", "--id", "api"],
+    ["csr", "inv.yaml", "--id", "api", "--live", "--password", "p"],
+])
+def test_csr_usage_errors(argv):
+    with pytest.raises(SystemExit) as exc:
+        main.main(argv)
+    assert exc.value.code == 2
+
+
+# --- validate --format ----------------------------------------------------------------
+
+def test_validate_csv_includes_invalid_assets(tmp_path, capsys):
+    import csv, io
+    cfg = write_yaml(tmp_path, {
+        "clusters": [{"name": "c1", "context": "ctx"}],
+        "assets": [
+            {"id": "ok", "cluster": "c1", "namespace": "ns", "cn": "ok.example.com", "certType": "pem"},
+            {"id": "no-cn", "cluster": "c1", "namespace": "ns", "certType": "pem"},
+        ],
+    })
+    code, out = run_cli(["validate", cfg, "--format", "csv"], capsys)
+    assert code == 1
+    rows = {r["id"]: r for r in csv.DictReader(io.StringIO(out))}
+    assert rows["ok"]["valid"] == "yes" and rows["ok"]["error"] == ""
+    assert rows["no-cn"]["valid"] == "no"
+    assert rows["no-cn"]["error"] == "missing required field: cn"
+
+
+def test_validate_table(capsys):
+    code, out = run_cli(["validate", EXAMPLE_CFG, "--format", "table"], capsys)
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0].split() == ["ID", "VALID", "ERROR", "CLUSTER", "NAMESPACE", "CN", "CERTTYPE", "MTLS"]
+    assert len(lines) == 4
+    assert "Clusters defined" not in out
 
 
 # --- optional dependencies --------------------------------------------------------
