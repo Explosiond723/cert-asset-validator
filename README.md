@@ -66,6 +66,11 @@ python main.py validate example-cfg.yaml --live
 python main.py validate example-cfg.yaml --live --format csv > inventory-report.csv
 python main.py search example-cfg.yaml --live --cn "api" --format table
 python main.py search example-cfg.yaml --live --context kind-test --kubeconfig ~/.kube/kind
+
+# Bootstrap an inventory from an existing cluster (read-only), then check it
+python main.py discover -n energia-prod -n billing-prod --output inventory.yaml
+python main.py discover -A --context prod-ocp-admin --cluster-name prod-ocp --output inventory.yaml
+python main.py validate inventory.yaml --live
 ```
 
 Running `python main.py` with no arguments prints usage help.
@@ -86,13 +91,19 @@ Running `python main.py` with no arguments prints usage help.
 - **Cluster connectivity** — connects to Kubernetes/OpenShift clusters via kubeconfig or in-cluster ServiceAccount, retrieves secrets, and discovers TLS-related secrets in a namespace. Works with any provider (OpenShift, GKE, EKS, AKS).
 - **Search & query** (`search`) — filter assets by CN (substring match), secret name, namespace, or cluster; combine multiple filters with AND logic
 - **Live mode** (`validate --live`, `search --live`) — read-only: fetches each asset's keystore/truststore and password from its Secrets, analyses the real certificates, and cross-checks them against the YAML (declared `certType` vs actual format, `cn` vs real CN/SANs, `mtls` without truststore, expiry). Each asset is checked independently: an unreachable cluster or a missing Secret is reported for that asset and the run continues; the exit code is 1 if any asset had errors. With `--live`, `search --cn` also matches the real CN and SANs.
+- **Auto-discovery** (`discover`) — scans the Secrets of one or more namespaces (read-only) and writes a YAML inventory that passes `validate`:
+  - finds `kubernetes.io/tls` Secrets and Opaque keys holding PEM, DER, PKCS12 or JKS material (detected by content, not only by key name); skips service-account tokens, registry credentials, Helm releases, private keys
+  - pairs keystores with truststores in the same Secret, or in a Secret with the same base name (`myapp-tls` + `myapp-truststore`), and sets `mtls: true` as an inferred value
+  - looks for the password in password-like keys of the same Secret and of related Secrets (`<base>-pass`, `<base>-password`, ...), and writes a `passwordRef` **only if that password actually opens the keystore**; otherwise it writes `TODO` with a comment
+  - reads `cn` from the certificate; notes cert-manager ownership and expiry as comments
+  - `-A` skips `kube-*`, `openshift*` and `default` unless `--include-system`; a namespace that cannot be listed is reported and skipped (exit 1, partial inventory still written)
+  - never writes secret values; `--output` refuses to overwrite an existing file without `--force`
 - **Output formats** (`--format list|table|csv` on `validate`, `search` and `analyse`) — `list` is the default human-readable layout; `table` is an aligned view; `csv` carries every field, one row per asset or certificate, multi-value cells joined with `; `
 
 ### Planned
 
 - **Cross-reference map** — show where the same cert lives across locations, CA inventory, keystore+truststore relationship analysis
 - **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
-- **Auto-discovery** — scan clusters and generate YAML inventory from existing Secrets
 - **Cert rotation** with `--live` — push a renewed certificate into every Secret where it lives
 
 See `ROADMAP.md` for the detailed implementation plan.
@@ -190,7 +201,7 @@ All cluster operations are opt-in via the `--live` flag. Default behaviour is of
 
 Context selection with `--live`: each asset uses the `context` of its cluster from the YAML; `--context` overrides it for every asset (useful for a local kind cluster); `--kubeconfig` points to a non-default kubeconfig file. Without clusters in the YAML (legacy format) and without `--context`, the tool tries the in-cluster ServiceAccount first, then the kubeconfig current context.
 
-Live mode only reads Secrets: the identity in use needs `get` on `secrets` in each asset's namespace. Passwords read from `passwordRef` are used in memory only and never printed (a trailing newline, as left by `echo pass | oc create secret ...`, is stripped).
+Live mode only reads Secrets: the identity in use needs `get` on `secrets` in each asset's namespace (`discover` also needs `list` on `secrets`, and `list` on `namespaces` for `-A`). Passwords read from `passwordRef` are used in memory only and never printed (a trailing newline, as left by `echo pass | oc create secret ...`, is stripped).
 
 ## License
 

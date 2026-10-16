@@ -116,8 +116,9 @@ The tool does NOT store credentials. It relies on the user's existing auth conte
 connect(config_file=None, context=None)  # if config_file given, use it; otherwise in-cluster first, then kubeconfig fallback
 get_secret_key(namespace, name, key) -> bytes  # base64-decoded single key from a Secret
 get_tls_password(namespace, name, key) -> bytes  # same as get_secret_key, semantically for passwords
-list_tls_secrets(namespace) -> list[dict]      # secrets with cert-like keys (kubernetes.io/tls + Opaque with *.pem, *.crt, etc.)
-list_tls_passwords(namespace) -> list[dict]    # Opaque secrets with password-like keys
+list_secrets(namespace, api) -> list            # every Secret of a namespace, for discover (RBAC: list secrets)
+list_namespaces(api) -> list[str]               # for discover -A (RBAC: list namespaces)
+current_context(config_file=None) -> str | None # kubeconfig current context name
 ```
 
 ### RBAC
@@ -356,9 +357,18 @@ For PKCS12/JKS targets, the tool needs the keystore password to repackage. It re
 
 ---
 
-## Step 7: Auto-discovery from cluster state
+## Step 7: Auto-discovery from cluster state — DONE
 
 Scan a cluster and automatically generate a YAML asset inventory by discovering TLS-related Secrets.
+Implemented in `discover.py` + `cmd_discover`; tests in `tests/test_discover.py` (fake API) and three scenarios in `e2e/kind.sh`.
+
+### What was implemented
+
+- Content-based detection (`cert_format`) on `kubernetes.io/tls` and on Opaque keys that look like certificates by name or by content; private keys, `ca.crt` of tls Secrets and non-certificate Secret types are skipped
+- Keystore/truststore role from the key name (`trust` → truststore); pairing in the same Secret or by base name across Secrets
+- Password discovery verified by opening the store (never writes an unverified passwordRef), `TODO` placeholders with comments otherwise
+- Schema change: `truststore.passwordRef` is now optional (a PEM CA bundle has no password); validated if present
+- Not implemented: grouping by Deployment/StatefulSet volume mounts; merging into an existing inventory (discover writes a new file)
 
 ### Discovery logic
 
@@ -379,10 +389,12 @@ Generated YAML passes `validate_config()` immediately. Includes comments marking
 
 ### Discovery CLI
 
+`discover` always reads from the cluster, so it takes no `--live` flag.
+
 ```bash
-python main.py discover --live --namespace energia-prod
-python main.py discover --live --all-namespaces
-python main.py discover --live --namespace energia-prod --output assets.yaml
+python main.py discover -n energia-prod
+python main.py discover -A --include-system --cluster-name prod-ocp
+python main.py discover -n energia-prod --output assets.yaml [--force]
 ```
 
 ---
@@ -408,6 +420,6 @@ These are smaller enhancements to the existing `cert_analysis.py` that add value
 4. **Step 4 (cross-reference map)** — the high-value feature; depends on connectivity
 5. **Step 5 (CSR generation)** — DONE (file and `--live`, subject/SAN edits, key reuse)
 6. **Step 6 (cert rotation)** — depends on cross-reference map + connectivity; the most operationally impactful feature
-7. **Step 7 (auto-discovery)** — nice bootstrapping tool; depends on connectivity
+7. **Step 7 (auto-discovery)** — DONE (`discover`)
 
 Steps 1-3 are the minimum viable product for daily use. Steps 4-5 make it genuinely valuable. Steps 6-7 make it a full lifecycle tool.

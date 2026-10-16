@@ -76,6 +76,18 @@ def test_validate_reports_every_invalid_asset(tmp_path, capsys):
     assert "error: asset[4]:" in out
 
 
+def test_validate_truststore_password_ref_is_optional_but_checked(tmp_path, capsys):
+    base = {"id": "a", "namespace": "ns", "cn": "a.example.com", "certType": "pkcs12",
+            "keystore": {"secret": {"name": "s", "key": "k.p12"}, "passwordRef": {"name": "p", "key": "k"}}}
+    pem_truststore = dict(base, truststore={"secret": {"name": "ca", "key": "ca.pem"}})
+    code, _ = run_cli(["validate", write_yaml(tmp_path, [pem_truststore])], capsys)
+    assert code == 0
+    incomplete = dict(base, truststore={"secret": {"name": "ca", "key": "t.jks"}, "passwordRef": {"name": "p"}})
+    code, out = run_cli(["validate", write_yaml(tmp_path, [incomplete])], capsys)
+    assert code == 1
+    assert "missing required field: truststore.passwordRef.key" in out
+
+
 def test_validate_missing_file_is_a_clean_error(tmp_path, capsys):
     code, out = run_cli(["validate", str(tmp_path / "missing.yaml")], capsys)
     assert code == 1
