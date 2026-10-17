@@ -381,7 +381,7 @@ Implemented in `discover.py` + `cmd_discover`; tests in `tests/test_discover.py`
    - Name prefix matching (`myapp-tls`, `myapp-tls-password`)
    - Labels/annotations (e.g. `cert-manager.io`)
    - Same Deployment/StatefulSet volume mounts (later)
-5. Infer mTLS if both keystore + truststore found
+5. ~~Infer mTLS if both keystore + truststore found~~ — dropped: keystore + truststore is also the normal setup for outbound TLS to a private CA, and mTLS is enforced by application/proxy config, not by Secrets. `discover` leaves `mtls` unset and writes the EKU / truststore hints as a comment. A reliable source would be Ingress `nginx.ingress.kubernetes.io/auth-tls-*` annotations referencing the Secret (future)
 
 ### Discovery output
 

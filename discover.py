@@ -269,8 +269,10 @@ def _build_asset(namespace, cluster_name, secret, ks, truststores, multiple, by_
         if ts_note:
             notes.append(f"truststore: {ts_note}")
         asset["truststore"] = _store_ref(ts_secret.metadata.name, ts, ts_pass)
-        asset["mtls"] = True
-        notes.append("mtls: inferred from the presence of a truststore")
+
+    note = _mtls_note(leaf, bool(truststores))
+    if note:
+        notes.append(note)
 
     annotations = secret.metadata.annotations or {}
     if "cert-manager.io/certificate-name" in annotations:
@@ -278,6 +280,27 @@ def _build_asset(namespace, cluster_name, secret, ks, truststores, multiple, by_
     if leaf:
         notes.append(f"{leaf['subject']}, {leaf['expiry']}")
     return asset, notes
+
+
+# _mtls_note explains why `mtls` is not written. Whether a service requires client
+# certificates is application/proxy configuration (Spring server.ssl.client-auth=need,
+# Tomcat clientAuth, nginx ssl_verify_client, Ingress auth-tls-*), not something stored in
+# a Secret. Keystore + truststore is also the normal setup for outbound TLS to a private
+# CA. The certificate's EKU only gives a hint: an EKU without clientAuth cannot be used as
+# an mTLS client certificate; clientAuth, or no EKU at all (RFC 5280: no restriction),
+# makes mTLS possible but not proven (many CAs set clientAuth by default).
+# Returns None when nothing suggests mTLS, to keep the YAML quiet.
+def _mtls_note(leaf, has_truststore: bool):
+    eku = (leaf or {}).get("eku", [])
+    client_auth = "clientAuth" in eku
+    if not has_truststore and not client_auth:
+        return None
+    hints = [f"EKU: {', '.join(eku)}" if eku else "no EKU (any usage allowed)"]
+    if has_truststore:
+        hints.append("truststore present")
+    verdict = "possible" if client_auth or not eku else "unlikely as client (EKU without clientAuth)"
+    return (f"mtls: not set, cannot be inferred from Secrets ({'; '.join(hints)}): {verdict}; "
+            "set it from the application config, e.g. client-auth=need")
 
 
 # render_inventory writes the discovered assets as YAML. PyYAML cannot emit comments,

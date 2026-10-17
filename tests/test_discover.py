@@ -116,8 +116,11 @@ def test_jks_with_passwords_found_and_verified(cluster_secrets):
     assert asset["keystore"]["passwordRef"] == {"name": "api-pass", "key": "keystorePassword"}
     # truststore password lives in the same Secret, under the key naming its role
     assert asset["truststore"]["passwordRef"] == {"name": "api-tls", "key": "truststorePassword"}
-    assert asset["mtls"] is True
-    assert any("inferred" in n for n in notes)
+    # keystore + truststore is not proof of mTLS: the field is not written, only a hint
+    assert "mtls" not in asset
+    note = next(n for n in notes if n.startswith("mtls:"))
+    # make_keystore's leaf has no EKU extension: no restriction, so client use is possible
+    assert "no EKU" in note and "truststore present" in note and "possible" in note
 
 
 def test_pkcs12_password_in_related_secret(cluster_secrets):
@@ -142,7 +145,7 @@ def test_truststore_secret_attached_by_base_name(cluster_secrets):
     found = discover_all(cluster_secrets)
     asset, _ = found["myapp-tls"]
     assert asset["truststore"] == {"secret": {"name": "myapp-truststore", "key": "truststore.pem"}}
-    assert asset["mtls"] is True
+    assert "mtls" not in asset
     assert "myapp-truststore" not in found  # not duplicated as its own asset
 
 
@@ -292,6 +295,22 @@ def test_jks_without_pyjks_says_so(monkeypatch, make_keystore):
     (asset, notes), = discover.discover_namespace("ns", [s], None, set())
     assert asset["keystore"]["passwordRef"] == {"name": "TODO", "key": "TODO"}
     assert any("pyjks is not installed" in n for n in notes)
+
+
+@pytest.mark.parametrize("eku, has_truststore, expected", [
+    ([], False, None),
+    ([], True, "possible"),                       # no EKU extension = any usage
+    (["serverAuth"], False, None),
+    (["serverAuth"], True, "unlikely as client (EKU without clientAuth)"),
+    (["serverAuth", "clientAuth"], False, "possible"),
+    (["serverAuth", "clientAuth"], True, "possible"),
+])
+def test_mtls_note(eku, has_truststore, expected):
+    note = discover._mtls_note({"eku": eku}, has_truststore)
+    if expected is None:
+        assert note is None
+    else:
+        assert note.startswith("mtls: not set") and expected in note
 
 
 def test_system_namespace_filter():
