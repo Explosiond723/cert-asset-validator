@@ -269,6 +269,9 @@ run() {
     } 2>&1 | tee "$OUT/run.log"
     echo
     echo "Log saved to $OUT/run.log"
+    # The counters live in the piped subshell above, so the verdict is read back from
+    # the log: exit 1 when any scenario did not behave as expected (needed for CI).
+    grep -q "^SUMMARY: .*, 0 unexpected$" "$OUT/run.log"
 }
 
 down() {
