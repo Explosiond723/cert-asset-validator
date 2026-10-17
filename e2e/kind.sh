@@ -182,9 +182,18 @@ EOF
     echo "Next: e2e/kind.sh run"
 }
 
-# scenario EXPECTED_RC "description" cmd...: runs one command, prints output and verdict
+# scenario EXPECTED_RC "description" cmd...: runs one command, prints its output and checks it.
+# An exit code alone is not enough: a crash also exits 1, so a scenario that expects a
+# failure would pass on a traceback. Before calling scenario, `expect` lists strings that
+# must appear in the output and `reject` strings that must not; both are reset after each
+# scenario. A Python traceback always fails the scenario.
 PASS=0
 FAIL=0
+EXPECT=()
+REJECT=()
+expect() { EXPECT=("$@"); }
+reject() { REJECT=("$@"); }
+
 scenario() {
     local expected_rc="$1" description="$2"
     shift 2
@@ -193,19 +202,61 @@ scenario() {
     echo "SCENARIO: $description"
     echo "COMMAND:  $*"
     echo "EXPECTED: exit $expected_rc"
+    local text
+    for text in ${EXPECT[@]+"${EXPECT[@]}"}; do echo "          + output contains: $text"; done
+    for text in ${REJECT[@]+"${REJECT[@]}"}; do echo "          - output lacks:    $text"; done
     echo "------------------------------------------------------------------"
+
+    local output rc
+    output="$(mktemp)"
     set +e
-    (cd "$OUT" && "$@")
-    local rc=$?
+    (cd "$OUT" && "$@") 2>&1 | tee "$output"
+    rc=${PIPESTATUS[0]}
     set -e
-    if [ "$rc" -eq "$expected_rc" ]; then
+
+    local problems=()
+    [ "$rc" -eq "$expected_rc" ] || problems+=("exit $rc, wanted $expected_rc")
+    if grep -q "Traceback (most recent call last)" "$output"; then
+        problems+=("Python traceback in the output")
+    fi
+    for text in ${EXPECT[@]+"${EXPECT[@]}"}; do
+        grep -qF -- "$text" "$output" || problems+=("missing from output: $text")
+    done
+    for text in ${REJECT[@]+"${REJECT[@]}"}; do
+        if grep -qF -- "$text" "$output"; then problems+=("unexpected in output: $text"); fi
+    done
+    rm -f "$output"
+    EXPECT=()
+    REJECT=()
+
+    if [ "${#problems[@]}" -eq 0 ]; then
         echo "RESULT:   exit $rc  [OK]"
         PASS=$((PASS + 1))
     else
-        echo "RESULT:   exit $rc  [UNEXPECTED, wanted $expected_rc]"
+        echo "RESULT:   exit $rc  [UNEXPECTED]"
+        for text in "${problems[@]}"; do echo "          * $text"; done
         FAIL=$((FAIL + 1))
     fi
 }
+
+# Small Python checks used by `run` to look inside the produced files.
+CSR_SUMMARY='
+import sys
+from cryptography import x509
+for path in sys.argv[1:]:
+    csr = x509.load_pem_x509_csr(open(path, "rb").read())
+    cn = csr.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0].value
+    sans = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    print(path + ": CN=" + cn + " SAN=" + ",".join(sans.get_values_for_type(x509.DNSName)))
+'
+PASSWORD_REFS='
+import sys, yaml
+for asset in yaml.safe_load(open(sys.argv[1]))["assets"]:
+    for role in ("keystore", "truststore"):
+        ref = (asset.get(role) or {}).get("passwordRef")
+        if ref:
+            print(asset["id"] + " " + role + " -> " + ref["name"] + "/" + ref["key"])
+'
 
 run() {
     require
@@ -219,38 +270,84 @@ run() {
         echo "git: $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo n/a)"
         echo "kind: $(kind version 2>/dev/null)  kubectl: $(kubectl version --client 2>/dev/null | head -1)"
 
+        expect "keystore: web-tls/tls.crt  [PEM, 2 cert(s)]" \
+            "keystore: api-tls/keystore.jks  [JKS, 2 cert(s)]" \
+            "truststore: api-tls/truststore.jks  [JKS, 1 cert(s)]" \
+            "keystore: billing-tls/keystore.p12  [PKCS12, 2 cert(s)]" \
+            "CN=billing.internal.example.com: certificate expires in" \
+            "CN=old.example.com: certificate expired" \
+            "certType 'der' declared, but the Secret contains PEM" \
+            "YAML cn 'www2.example.com' does not match the certificate" \
+            "ERROR: keystore: Secret 'web-prod/does-not-exist' not found" \
+            "ERROR: keystore: permission denied reading Secret 'restricted/restricted-tls'" \
+            "ERROR: failed to load context 'context-that-does-not-exist'" \
+            "Live: web-limited  (context: $LIMITED_CTX)"
+        reject "wrong password" "not valid UTF-8" "unable to detect certificate format"
         scenario 1 "validate --live: 3 OK, 3 warnings, 3 errors (see inventory comments)" \
             "${main[@]}" validate "$inv" "${live[@]}"
+        expect "LIVE_SUBJECT" "keystore: Secret 'web-prod/does-not-exist' not found" "expires in"
         scenario 1 "validate --live as table" \
             "${main[@]}" validate "$inv" "${live[@]}" --format table
+        expect "id,cluster,namespace,cn,certType,live_subject" \
+            "api,kind-admin,api-prod,api.example.com,keystore" "DNS:api.example.com"
         scenario 0 "search --live, real SAN match, admin cluster only, csv" \
             "${main[@]}" search "$inv" "${live[@]}" --cluster kind-admin --namespace api-prod --cn "DNS:api" --format csv
+        expect "Found 1 matching assets" "certificate expires in" "(threshold: 30 days)"
+        reject "error:"
         scenario 0 "search --live billing: warning only, exit 0 without --fail-on-expiry" \
             "${main[@]}" search "$inv" "${live[@]}" --namespace billing-prod
+        expect "error: 1 asset(s) with certificates expired, not yet valid, or expiring within 30 days"
         scenario 1 "search --live billing --fail-on-expiry (10 days < 30)" \
             "${main[@]}" search "$inv" "${live[@]}" --namespace billing-prod --fail-on-expiry
+        expect "Found 1 matching assets" "live: O=cert-asset-validator e2e,CN=billing.internal.example.com"
+        reject "WARNING" "error:"
         scenario 0 "search --live billing --fail-on-expiry --warn-days 5" \
             "${main[@]}" search "$inv" "${live[@]}" --namespace billing-prod --fail-on-expiry --warn-days 5
+        expect "Found 1 matching assets" "live: O=cert-asset-validator e2e,CN=www.example.com"
+        reject "permission denied"
         scenario 0 "search --live with --context override (every asset via the admin context)" \
             "${main[@]}" search "$inv" "${live[@]}" --context "$ADMIN_CTX" --namespace restricted
+        expect "CSR written to: api.csr" "Private key written to: api-key.pem"
         scenario 0 "csr --live from JKS (password from Secret), new CN and extra SAN" \
             "${main[@]}" csr "$inv" --id api "${live[@]}" --cn api-v2.example.com --add-san DNS:api.example.com
+        expect "CSR written to: web.csr" "existing key reused, no new key written"
         scenario 0 "csr --live from kubernetes.io/tls, reusing tls.key" \
             "${main[@]}" csr "$inv" --id web "${live[@]}" --reuse-key
+        expect "CSR written to: billing.csr" "existing key reused, no new key written"
         scenario 0 "csr --live from PKCS12, reusing the key inside the keystore" \
             "${main[@]}" csr "$inv" --id billing "${live[@]}" --reuse-key
+        # the CSRs must carry what was asked: new CN + SANs for api, the same subject for web
+        expect "api.csr: CN=api-v2.example.com SAN=api-v2.example.com,api.example.com" \
+            "web.csr: CN=www.example.com SAN=www.example.com" \
+            "billing.csr: CN=billing.internal.example.com SAN=billing.internal.example.com"
+        scenario 0 "CSR contents: subject and SANs" "$PY" -c "$CSR_SUMMARY" api.csr web.csr billing.csr
+        expect "error: restricted: permission denied reading Secret 'restricted/restricted-tls'"
         scenario 1 "csr --live on an asset the limited identity cannot read" \
             "${main[@]}" csr "$inv" --id restricted "${live[@]}"
+        expect "discovered 5 asset(s) in 3 namespace(s)"
+        reject "TODO values"
         scenario 0 "discover: scan the test namespaces and write an inventory" \
             "${main[@]}" discover -n web-prod -n api-prod -n billing-prod \
             --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --output discovered.yaml --force
+        # the passwords must have been found in the right Secrets (and verified by discover)
+        expect "api-tls keystore -> api-pass/keystorePassword" \
+            "api-tls truststore -> api-tls/truststorePassword" \
+            "billing-tls keystore -> billing-tls-pass/keystorePassword"
+        reject "TODO"
+        scenario 0 "discovered inventory: passwordRefs" "$PY" -c "$PASSWORD_REFS" discovered.yaml
+        expect "api-tls" "billing-tls" "web-tls" "certificate expires in"
+        reject "not found" "permission denied" "wrong password"
         scenario 0 "validate --live on the discovered inventory (passwords found and verified, warnings only)" \
             "${main[@]}" validate "$OUT/discovered.yaml" "${live[@]}" --format table
+        expect "no new assets, discovered.yaml unchanged, 5 already in the inventory"
         scenario 0 "discover --update on the same namespaces: nothing new, file unchanged" \
             "${main[@]}" discover -n web-prod -n api-prod -n billing-prod \
             --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --update discovered.yaml
+        expect "warning: permission denied listing secrets in namespace 'api-prod'" \
+            "discovered 3 asset(s) in 1 namespace(s), 1 namespace(s) skipped"
         scenario 1 "discover with the limited identity: web-prod readable, api-prod denied" \
             "${main[@]}" discover -n web-prod -n api-prod --kubeconfig "$KCFG" --context "$LIMITED_CTX"
+        expect "PrivateKeyEntry" "CN=api.example.com" "DNS:api.example.com"
         scenario 0 "analyse the generated CSR inputs: JKS keystore from disk" \
             "${main[@]}" analyse "$OUT/certs/api-keystore.jks" --password changeit --format table
 
@@ -280,9 +377,13 @@ down() {
     echo "cluster $CLUSTER_NAME and $OUT removed"
 }
 
-case "${1:-}" in
-    up) up ;;
-    run) run ;;
-    down) down ;;
-    *) echo "usage: $0 up|run|down" >&2; exit 2 ;;
-esac
+# Dispatch only when executed: sourcing the file (tests/test_e2e_harness.py) just
+# defines the functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    case "${1:-}" in
+        up) up ;;
+        run) run ;;
+        down) down ;;
+        *) echo "usage: $0 up|run|down" >&2; exit 2 ;;
+    esac
+fi
