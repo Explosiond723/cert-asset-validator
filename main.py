@@ -1,9 +1,10 @@
 import argparse
 import logging
 import os
+import re
 import sys
 import yaml
-from cert_analysis import cert_format, cert_metadata_extract, eku_inspect, csr_generate, expiry_warning
+from cert_analysis import cert_format, cert_metadata_extract, mtls_candidate, csr_generate, expiry_warning
 from output import FORMATS, render_rows
 # live.py / cluster.py (and the kubernetes client they need) are deliberately NOT imported
 # here: they are imported by make_live_clients() only when --live is used, so offline
@@ -20,6 +21,11 @@ def load_config(path: str) -> dict:
     """
     with open(path, "rt") as cfg_file:
         data = yaml.safe_load(cfg_file)
+    return normalize_config(data)
+
+
+# normalize_config turns parsed YAML into {'clusters': [...], 'assets': [...]}.
+def normalize_config(data) -> dict:
     if data is None:
         raise ValueError("config file is empty")
 
@@ -121,7 +127,10 @@ def validate_config(cfg: dict, cluster_names: list[str]) -> None:
         require_path(cfg, "truststore.secret.name")
         require_path(cfg, "truststore.secret.key")
 
-        if needs_password:
+        # passwordRef is optional: a PEM truststore (CA bundle) has no password even when
+        # the keystore is a PKCS12/JKS. If present it must be complete; if the truststore
+        # needs one and it is missing, `--live` reports it.
+        if "passwordRef" in cfg["truststore"]:
             require_dict(cfg, "truststore.passwordRef")
             require_path(cfg, "truststore.passwordRef.name")
             require_path(cfg, "truststore.passwordRef.key")
@@ -130,6 +139,17 @@ def validate_config(cfg: dict, cluster_names: list[str]) -> None:
     if "mtls" in cfg and not isinstance(cfg["mtls"], bool):
         raise ValueError("field 'mtls' must be boolean")
 
+    # notes optional: free-form key -> text, written by discover and editable by hand.
+    # Each key becomes a notes_<key> column in csv output.
+    if "notes" in cfg:
+        if not isinstance(cfg["notes"], dict):
+            raise ValueError("field 'notes' must be a dictionary (key: text)")
+        for key, value in cfg["notes"].items():
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_]+", key):
+                raise ValueError(f"notes key '{key}' must contain only letters, digits and _")
+            if isinstance(value, (dict, list)):
+                raise ValueError(f"notes.{key} must be a single value, not a list or dictionary")
+
 
 # make_live_clients prepares cluster access for --live. clusters is the validated
 # clusters section; each asset is routed to its cluster's kubeconfig context.
@@ -137,6 +157,32 @@ def make_live_clients(args, clusters: list[dict]):
     from live import ClusterClients
     contexts = {c["name"]: c["context"] for c in clusters}
     return ClusterClients(contexts, kubeconfig=args.kubeconfig, context_override=args.context)
+
+
+# Notes written by discover come first, in this order; other (hand-written) keys follow
+# alphabetically.
+NOTE_KEY_ORDER = ("mtls", "keystore_password", "truststore_password", "cn", "managed_by", "content")
+
+
+def note_keys(assets: list[dict]) -> list[str]:
+    keys = {k for a in assets if isinstance(a, dict) for k in (a.get("notes") or {})}
+    return [k for k in NOTE_KEY_ORDER if k in keys] + sorted(keys - set(NOTE_KEY_ORDER))
+
+
+# note_fields returns the notes of an asset as output columns: one notes_<key> column per
+# key in csv (full text, for spreadsheets), a single `notes` column listing the keys in
+# table (full text does not fit a terminal).
+def note_fields(asset: dict, keys: list[str], fmt: str) -> dict:
+    notes = (asset or {}).get("notes") or {}
+    if fmt == "csv":
+        return {f"notes_{k}": notes.get(k) for k in keys}
+    return {"notes": ", ".join(k for k in keys if k in notes)}
+
+
+def note_columns(keys: list[str], fmt: str) -> list[str]:
+    if not keys:
+        return []
+    return [f"notes_{k}" for k in keys] if fmt == "csv" else ["notes"]
 
 
 # live_row_fields returns the columns `--live` adds to table/csv output for one asset.
@@ -190,15 +236,18 @@ def cmd_validate(args):
         print_validate_list(clusters, cluster_names, records, results)
     else:
         rows = []
+        keys = note_keys([cfg for _, cfg, _ in records])
         for asset_id, cfg, error in records:
             cfg = cfg or {}
             row = {"id": asset_id, "valid": "no" if error else "yes", "error": error,
                    "cluster": cfg.get("cluster"), "namespace": cfg.get("namespace"), "cn": cfg.get("cn"),
                    "certType": cfg.get("certType"), "mtls": cfg.get("mtls", False) if cfg else None}
+            row.update(note_fields(cfg, keys, args.format))
             if args.live:
                 row.update(live_row_fields(results[asset_id]) if asset_id in results else {})
             rows.append(row)
         columns = ["id", "valid", "error", "cluster", "namespace", "cn", "certType", "mtls"]
+        columns += note_columns(keys, args.format)
         if args.live:
             columns += ["live_subject", "not_valid_after", "days_remaining", "expiry", "san", "warnings", "errors"]
         render_rows(rows, columns, args.format)
@@ -224,6 +273,8 @@ def print_validate_list(clusters, cluster_names, records, results) -> None:
         print("CN:      ", cfg["cn"])
         print("certType: ", cfg["certType"])
         print("mTLS:     ", cfg.get("mtls", False))
+        for key, value in (cfg.get("notes") or {}).items():
+            print(f"Note {key}: {value}")
         print("----")
     if results:
         from live import print_inspection
@@ -285,8 +336,9 @@ def cmd_analyse(args):
             print(f"  WARNING: {warning}")
         print("----")
 
-    is_mtls = eku_inspect(metadata)
-    print(f"mTLS candidate: {is_mtls}")
+    # a hint from the leaf EKU only: whether mTLS is enforced is application config
+    is_mtls, reason = mtls_candidate(metadata)
+    print(f"mTLS candidate: {is_mtls} ({reason})")
     exit_on_expiry(args, expiring)
 
 
@@ -360,6 +412,186 @@ def cmd_csr(args):
         f.write(key_pem)
     print(f"Private key written to: {key_path}")
 
+# System namespaces skipped by `discover --all-namespaces` unless --include-system:
+# on OpenShift they hold hundreds of operator-managed certificates.
+SYSTEM_NAMESPACE_PREFIXES = ("kube-", "openshift")
+
+
+def is_system_namespace(namespace: str) -> bool:
+    return namespace == "default" or namespace.startswith(SYSTEM_NAMESPACE_PREFIXES)
+
+
+# make_discover_api connects for `discover` and returns (CoreV1Api, context name or None).
+def make_discover_api(args):
+    import cluster
+    from kubernetes import client
+    context = args.context or cluster.current_context(args.kubeconfig)
+    api = client.CoreV1Api(cluster.connect(config_file=args.kubeconfig, context=args.context))
+    return api, context
+
+
+# cmd_discover scans Secrets (read-only) and writes a YAML inventory that passes `validate`.
+# Values the tool cannot infer are written as TODO with a comment; passwords are only
+# referenced (passwordRef) after they were verified to open the keystore.
+def cmd_discover(args):
+    import cluster
+    from discover import discover_namespace, render_inventory
+
+    if args.output and os.path.exists(args.output) and not args.force:
+        raise ValueError(f"{args.output} already exists, use --force to overwrite it")
+
+    # --update: load the inventory first, so a bad file fails before scanning the cluster
+    existing = load_existing_inventory(args.update) if args.update else None
+
+    try:
+        api, context = make_discover_api(args)
+        if args.all_namespaces:
+            namespaces = [
+                ns for ns in cluster.list_namespaces(api)
+                if args.include_system or not is_system_namespace(ns)
+            ]
+        else:
+            namespaces = list(dict.fromkeys(args.namespace))  # drop repeated -n, keep order
+    except cluster.ClusterError as e:
+        raise ValueError(str(e))
+
+    if existing is not None:
+        cluster_name = update_cluster_name(existing, args.cluster_name, context, args.update)
+        used_ids = {a["id"] for a in existing["assets"] if isinstance(a, dict) and "id" in a}
+    else:
+        # The cluster name in the YAML defaults to the kubeconfig context. Without any context
+        # (in-cluster ServiceAccount) the legacy format without a clusters section is written.
+        cluster_name = args.cluster_name or context
+        used_ids = set()
+
+    discovered, failed = [], []
+    for namespace in namespaces:
+        try:
+            secrets = cluster.list_secrets(namespace, api)
+        except cluster.ClusterError as e:
+            print(f"warning: {e}", file=sys.stderr)
+            failed.append(namespace)
+            continue
+        discovered += discover_namespace(namespace, secrets, cluster_name, used_ids)
+
+    # Safety net: what discover writes must pass validate as is.
+    for asset, _comments in discovered:
+        validate_config(asset, [cluster_name] if cluster_name else [])
+
+    scanned = [ns for ns in namespaces if ns not in failed]
+    if existing is not None:
+        summary = update_inventory(args.update, existing, discovered, cluster_name, context, scanned)
+    else:
+        header = [
+            "Generated by `main.py discover` (read-only scan of Kubernetes Secrets).",
+            "Review the comments: values marked TODO could not be inferred; mtls is never set automatically.",
+            f"context: {context or '(in-cluster)'}  namespaces: {', '.join(namespaces) or '(none)'}",
+        ]
+        text = render_inventory(cluster_name, context, discovered, header)
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(text)
+        else:
+            sys.stdout.write(text)
+        todo = sum(1 for asset, _ in discovered if "TODO" in repr(asset))
+        summary = (f"discovered {len(discovered)} asset(s) in {len(scanned)} namespace(s)"
+                   + (f", {todo} with TODO values" if todo else "")
+                   + (f", written to {args.output}" if args.output else ""))
+
+    print(summary + (f", {len(failed)} namespace(s) skipped" if failed else ""), file=sys.stderr)
+    if failed:
+        sys.exit(1)
+
+
+# load_existing_inventory reads the file given to `discover --update` and validates it, so
+# new assets are only ever appended to an inventory that is valid to begin with.
+def load_existing_inventory(path: str) -> dict:
+    with open(path) as f:
+        text = f.read()
+    data = yaml.safe_load(text)
+    existing = normalize_config(data)
+    cluster_names = []
+    for cluster_def in existing["clusters"]:
+        validate_cluster(cluster_def)
+        cluster_names.append(cluster_def["name"])
+    for i, asset in enumerate(existing["assets"]):
+        asset_id = asset.get("id", f"asset[{i}]") if isinstance(asset, dict) else f"asset[{i}]"
+        try:
+            validate_config(asset, cluster_names)
+        except ValueError as e:
+            raise ValueError(f"{path} is not valid, fix it before --update ({asset_id}: {e})")
+    existing["text"] = text
+    existing["legacy_list"] = isinstance(data, list)
+    return existing
+
+
+# update_cluster_name picks the cluster name for appended assets. With a clusters section
+# it must be one of its names: --cluster-name if given, otherwise the cluster whose context
+# is the one being scanned. A missing cluster is an error rather than an edit in the middle
+# of the file. Without a clusters section (legacy inventory) assets get no cluster field.
+def update_cluster_name(existing: dict, requested: str, context: str, path: str):
+    clusters = existing["clusters"]
+    if not clusters:
+        return None
+    names = [c["name"] for c in clusters]
+    if requested:
+        if requested not in names:
+            raise ValueError(f"cluster '{requested}' is not defined in {path} (clusters: {', '.join(names)})")
+        return requested
+    for c in clusters:
+        if c["context"] == context:
+            return c["name"]
+    raise ValueError(
+        f"no cluster in {path} uses context '{context}': add it to the clusters section "
+        f"(name: <name>, context: {context}) or pass --cluster-name"
+    )
+
+
+# update_inventory appends the assets that are not yet in the inventory and returns the
+# summary line. Existing assets are never modified or removed: those whose Secrets were
+# not found in the scanned namespaces are only listed.
+def update_inventory(path: str, existing: dict, discovered: list, cluster_name, context, scanned: list[str]) -> str:
+    from datetime import datetime, timezone
+    from discover import append_assets, asset_refs
+
+    known = set().union(*(asset_refs(a) for a in existing["assets"])) if existing["assets"] else set()
+    new = [(a, c) for a, c in discovered if not (asset_refs(a) & known)]
+
+    found = set().union(*(asset_refs(a) for a, _ in discovered)) if discovered else set()
+    gone = [a.get("id", "?") for a in existing["assets"]
+            if isinstance(a, dict) and a.get("cluster") == cluster_name and a.get("namespace") in scanned
+            and asset_refs(a) and not (asset_refs(a) & found)]
+
+    if new:
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        header = [f"--- {len(new)} asset(s) added by `main.py discover --update` on {stamp}",
+                  f"--- context: {context or '(in-cluster)'}  namespaces: {', '.join(scanned)}"]
+        text = append_assets(existing["text"], new, header, existing["legacy_list"])
+
+        # Re-parse before writing: the file must hold exactly the old assets plus the new ones.
+        unsafe = ValueError(f"cannot append safely to {path} (is 'assets' the last section of the file?); "
+                            "nothing was written, use --output to write a new file instead")
+        try:
+            result = normalize_config(yaml.safe_load(text))
+        except (yaml.YAMLError, ValueError):
+            raise unsafe
+        if result["assets"] != existing["assets"] + [a for a, _ in new] or result["clusters"] != existing["clusters"]:
+            raise unsafe
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)  # atomic: the inventory is never left half-written
+
+    todo = sum(1 for asset, _ in new if "TODO" in repr(asset))
+    summary = (f"{len(new)} new asset(s) appended to {path}" if new else f"no new assets, {path} unchanged")
+    summary += f", {len(discovered) - len(new)} already in the inventory"
+    if todo:
+        summary += f", {todo} new with TODO values"
+    if gone:
+        summary += f"; not found in the cluster any more (kept in the file): {', '.join(gone)}"
+    return summary
+
+
 # cmd_search is a simple filter that loads the YAML config and prints assets that match the provided filters.
 # This is useful for quickly finding assets in a large inventory without needing to use `kubectl` or query the cluster directly.
 def cmd_search(args):
@@ -399,9 +631,11 @@ def cmd_search(args):
 
     if args.format != "list":
         rows = []
+        keys = note_keys(assets)
         for asset in assets:
             row = {"id": asset["id"], "cluster": asset.get("cluster", ""), "namespace": asset["namespace"],
                    "cn": asset["cn"], "certType": asset["certType"]}
+            row.update(note_fields(asset, keys, args.format) if keys else {})
             if args.live:
                 row.update(live_row_fields(results[asset["id"]]))
             rows.append(row)
@@ -544,6 +778,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_format_argument(search_parser)
     search_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
+    # `python main.py discover (-n NS ... | -A) [--output FILE]`
+    # Scans Secrets (read-only) and generates a YAML inventory. Always connects to the
+    # cluster: there is nothing to discover offline, so it takes no --live flag.
+    discover_parser = subparsers.add_parser("discover", help="Generate a YAML inventory by scanning Secrets in a cluster")
+    ns_group = discover_parser.add_mutually_exclusive_group(required=True)
+    ns_group.add_argument("-n", "--namespace", action="append", metavar="NS", help="Namespace to scan (repeatable)")
+    ns_group.add_argument("-A", "--all-namespaces", action="store_true",
+                          help="Scan every namespace except kube-*, openshift*, default (see --include-system)")
+    discover_parser.add_argument("--include-system", action="store_true",
+                                 help="With --all-namespaces, also scan kube-*, openshift* and default")
+    discover_parser.add_argument("--context", help="kubeconfig context to scan (default: current context)")
+    discover_parser.add_argument("--kubeconfig", metavar="PATH", help="Path to a kubeconfig file")
+    discover_parser.add_argument("--cluster-name", help="Cluster name to write in the YAML (default: the context name)")
+    out_group = discover_parser.add_mutually_exclusive_group()
+    out_group.add_argument("--output", metavar="FILE", help="Write the inventory to FILE instead of stdout")
+    out_group.add_argument("--update", metavar="FILE",
+                           help="Append only new assets to an existing inventory; existing entries, hand edits "
+                                "and comments are kept as they are")
+    discover_parser.add_argument("--force", action="store_true", help="Overwrite --output if it exists")
+    discover_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
+
     # Global flag (applies to all subcommands): -v / --verbose
     # The subcommand copies of -v use default=argparse.SUPPRESS: otherwise their default
     # (False) would overwrite a -v given before the subcommand (`main.py -v analyse ...`).
@@ -555,6 +810,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {
+    "discover": cmd_discover,
     "validate": cmd_validate,
     "analyse": cmd_analyse,
     "csr": cmd_csr,
@@ -576,7 +832,7 @@ def main(argv: list[str] = None) -> None:
         parser.print_help()
         return
 
-    if not getattr(args, "live", False) and (getattr(args, "context", None) or getattr(args, "kubeconfig", None)):
+    if args.command != "discover" and not getattr(args, "live", False) and (getattr(args, "context", None) or getattr(args, "kubeconfig", None)):
         parser.error("--context and --kubeconfig require --live")
     if args.command == "csr":
         if args.live and not args.id:
@@ -589,6 +845,8 @@ def main(argv: list[str] = None) -> None:
             parser.error("--key-output is not used when an existing key is reused")
         if args.key_password and not args.key:
             parser.error("--key-password requires --key")
+    if args.command == "discover" and args.include_system and not args.all_namespaces:
+        parser.error("--include-system requires --all-namespaces")
     if args.command in ("validate", "search") and args.fail_on_expiry and not args.live:
         parser.error("--fail-on-expiry requires --live for validate and search (the YAML holds no certificate data)")
 
@@ -599,6 +857,10 @@ def main(argv: list[str] = None) -> None:
         COMMANDS[args.command](args)
     except (ValueError, OSError) as e:
         print(f"error: {e}")
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        # malformed inventory: PyYAML's message already carries file, line and column
+        print(f"error: invalid YAML: {e}")
         sys.exit(1)
 
 

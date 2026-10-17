@@ -66,6 +66,14 @@ python main.py validate example-cfg.yaml --live
 python main.py validate example-cfg.yaml --live --format csv > inventory-report.csv
 python main.py search example-cfg.yaml --live --cn "api" --format table
 python main.py search example-cfg.yaml --live --context kind-test --kubeconfig ~/.kube/kind
+
+# Bootstrap an inventory from an existing cluster (read-only), then check it
+python main.py discover -n energia-prod -n billing-prod --output inventory.yaml
+python main.py discover -A --context prod-ocp-admin --cluster-name prod-ocp --output inventory.yaml
+python main.py validate inventory.yaml --live
+
+# Later: add only the Secrets that are new, keeping every hand edit and comment
+python main.py discover -A --update inventory.yaml
 ```
 
 Running `python main.py` with no arguments prints usage help.
@@ -75,7 +83,7 @@ Running `python main.py` with no arguments prints usage help.
 ### Available now
 
 - **YAML validation** (`validate`) — parses single or multiple certificate asset definitions, validates required fields and structure based on `certType`, fails fast with human-readable errors
-- **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates
+- **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates (from the leaf certificate's EKU only: `clientAuth` or no EKU at all; a hint, since mTLS is enforced by application config)
 - **Expiration warnings** — every analysed certificate reports `validity_status`, `days_remaining` and a readable `expiry` label; a `WARNING` line is printed for expired, not-yet-valid, or soon-to-expire certificates (`--warn-days`, default 30). By default warnings do not change the exit code; `--fail-on-expiry` (on `analyse`, and on `validate`/`search` with `--live`) exits 1 when any certificate triggers one, with the reason on stderr so CSV output stays clean
 - **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
 - **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate (PEM, DER, PKCS12, JKS), preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions. By default it generates a new key pair matching the original key type and size (written with mode 0600). Options:
@@ -86,13 +94,27 @@ Running `python main.py` with no arguments prints usage help.
 - **Cluster connectivity** — connects to Kubernetes/OpenShift clusters via kubeconfig or in-cluster ServiceAccount, retrieves secrets, and discovers TLS-related secrets in a namespace. Works with any provider (OpenShift, GKE, EKS, AKS).
 - **Search & query** (`search`) — filter assets by CN (substring match), secret name, namespace, or cluster; combine multiple filters with AND logic
 - **Live mode** (`validate --live`, `search --live`) — read-only: fetches each asset's keystore/truststore and password from its Secrets, analyses the real certificates, and cross-checks them against the YAML (declared `certType` vs actual format, `cn` vs real CN/SANs, `mtls` without truststore, expiry). Each asset is checked independently: an unreachable cluster or a missing Secret is reported for that asset and the run continues; the exit code is 1 if any asset had errors. With `--live`, `search --cn` also matches the real CN and SANs.
+- **Auto-discovery** (`discover`) — scans the Secrets of one or more namespaces (read-only) and writes a YAML inventory that passes `validate`:
+  - finds `kubernetes.io/tls` Secrets and Opaque keys holding PEM, DER, PKCS12 or JKS material (detected by content, not only by key name); skips service-account tokens, registry credentials, Helm releases, private keys
+  - pairs keystores with truststores in the same Secret, or in a Secret with the same base name (`myapp-tls` + `myapp-truststore`)
+  - never sets `mtls`: whether a service requires client certificates is application or proxy configuration (`client-auth=need`, `ssl_verify_client`, Ingress `auth-tls-*`), and keystore + truststore is also the normal setup for outbound TLS. `notes.mtls` reports the hints that are available (truststore present, leaf EKU)
+  - findings for people go in the asset's `notes` field (`mtls`, `keystore_password`, `truststore_password`, `cn`, `managed_by`, `content`), so they reach table/csv output; YAML comments only carry the subject and expiry
+  - looks for the password, in this order: password-like keys of the same Secret; any key of a Secret related by name, i.e. the base name (`billing` for `billing-tls`) as prefix or suffix plus a password-like word (`billing-pwd`, `billing.password`, `billing-tls-pw`, `billing-keystore-pass`, `billing-creds`, `pwd-billing`, ...); keys named after the app in shared password Secrets (`app-passwords: {billing: ...}`); finally password-like keys of any other Secret in the namespace, flagged with a comment because a default password shared by several apps also matches. A `passwordRef` is written **only if that password actually opens the keystore**; otherwise `TODO` with a comment
+  - reads `cn` from the certificate; notes cert-manager ownership and expiry as comments
+  - `-A` skips `kube-*`, `openshift*` and `default` unless `--include-system`; a namespace that cannot be listed is reported and skipped (exit 1, partial inventory still written)
+  - never writes secret values; `--output` refuses to overwrite an existing file without `--force`
+  - `--update FILE` keeps an inventory up to date after you edited it by hand (filled TODOs, fixed a `passwordRef`, renamed ids, added notes and comments):
+    - an asset is recognised by the Secrets it points to (cluster + namespace + Secret + key of keystore or truststore), not by its id, so renamed assets are not duplicated
+    - only new assets are appended, as text, at the end of the `assets` list with the same indentation: the rest of the file stays byte for byte, comments included
+    - the result is re-parsed before writing (it must contain exactly the old assets plus the new ones) and written atomically; if appending is not safe (e.g. `assets` is not the last section) nothing is written
+    - the cluster must already be in the `clusters` section (matched by kubeconfig context, or `--cluster-name`); assets whose Secrets disappeared are listed, never removed
+- **Notes** (`notes:` on an asset, optional) — free-form `key: text` pairs, written by `discover` and editable by hand (e.g. `owner: team-payments`). In `--format csv` every key becomes a `notes_<key>` column, ready for spreadsheet filtering; `table` shows a `notes` column listing the keys; `validate` (list) prints them
 - **Output formats** (`--format list|table|csv` on `validate`, `search` and `analyse`) — `list` is the default human-readable layout; `table` is an aligned view; `csv` carries every field, one row per asset or certificate, multi-value cells joined with `; `
 
 ### Planned
 
 - **Cross-reference map** — show where the same cert lives across locations, CA inventory, keystore+truststore relationship analysis
 - **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
-- **Auto-discovery** — scan clusters and generate YAML inventory from existing Secrets
 - **Cert rotation** with `--live` — push a renewed certificate into every Secret where it lives
 
 See `ROADMAP.md` for the detailed implementation plan.
@@ -190,7 +212,7 @@ All cluster operations are opt-in via the `--live` flag. Default behaviour is of
 
 Context selection with `--live`: each asset uses the `context` of its cluster from the YAML; `--context` overrides it for every asset (useful for a local kind cluster); `--kubeconfig` points to a non-default kubeconfig file. Without clusters in the YAML (legacy format) and without `--context`, the tool tries the in-cluster ServiceAccount first, then the kubeconfig current context.
 
-Live mode only reads Secrets: the identity in use needs `get` on `secrets` in each asset's namespace. Passwords read from `passwordRef` are used in memory only and never printed (a trailing newline, as left by `echo pass | oc create secret ...`, is stripped).
+Live mode only reads Secrets: the identity in use needs `get` on `secrets` in each asset's namespace (`discover` also needs `list` on `secrets`, and `list` on `namespaces` for `-A`). Passwords read from `passwordRef` are used in memory only and never printed (a trailing newline, as left by `echo pass | oc create secret ...`, is stripped).
 
 ## License
 

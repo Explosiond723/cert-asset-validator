@@ -71,7 +71,7 @@ up() {
     # restricted: readable by the admin context only
     apply_secret tls restricted-tls -n restricted --cert "$c/web.crt" --key "$c/web.key"
 
-    # Limited identity: ServiceAccount allowed to `get` secrets in web-prod only
+    # Limited identity: ServiceAccount allowed to `get`/`list` secrets in web-prod only
     kc apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: ServiceAccount
@@ -80,7 +80,7 @@ metadata: {name: cert-reader, namespace: cert-validator}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata: {name: cert-reader, namespace: web-prod}
-rules: [{apiGroups: [""], resources: ["secrets"], verbs: ["get"]}]
+rules: [{apiGroups: [""], resources: ["secrets"], verbs: ["get", "list"]}]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -241,6 +241,16 @@ run() {
             "${main[@]}" csr "$inv" --id billing "${live[@]}" --reuse-key
         scenario 1 "csr --live on an asset the limited identity cannot read" \
             "${main[@]}" csr "$inv" --id restricted "${live[@]}"
+        scenario 0 "discover: scan the test namespaces and write an inventory" \
+            "${main[@]}" discover -n web-prod -n api-prod -n billing-prod \
+            --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --output discovered.yaml --force
+        scenario 0 "validate --live on the discovered inventory (passwords found and verified, warnings only)" \
+            "${main[@]}" validate "$OUT/discovered.yaml" "${live[@]}" --format table
+        scenario 0 "discover --update on the same namespaces: nothing new, file unchanged" \
+            "${main[@]}" discover -n web-prod -n api-prod -n billing-prod \
+            --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --update discovered.yaml
+        scenario 1 "discover with the limited identity: web-prod readable, api-prod denied" \
+            "${main[@]}" discover -n web-prod -n api-prod --kubeconfig "$KCFG" --context "$LIMITED_CTX"
         scenario 0 "analyse the generated CSR inputs: JKS keystore from disk" \
             "${main[@]}" analyse "$OUT/certs/api-keystore.jks" --password changeit --format table
 

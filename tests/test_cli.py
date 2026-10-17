@@ -76,6 +76,28 @@ def test_validate_reports_every_invalid_asset(tmp_path, capsys):
     assert "error: asset[4]:" in out
 
 
+def test_validate_truststore_password_ref_is_optional_but_checked(tmp_path, capsys):
+    base = {"id": "a", "namespace": "ns", "cn": "a.example.com", "certType": "pkcs12",
+            "keystore": {"secret": {"name": "s", "key": "k.p12"}, "passwordRef": {"name": "p", "key": "k"}}}
+    pem_truststore = dict(base, truststore={"secret": {"name": "ca", "key": "ca.pem"}})
+    code, _ = run_cli(["validate", write_yaml(tmp_path, [pem_truststore])], capsys)
+    assert code == 0
+    incomplete = dict(base, truststore={"secret": {"name": "ca", "key": "t.jks"}, "passwordRef": {"name": "p"}})
+    code, out = run_cli(["validate", write_yaml(tmp_path, [incomplete])], capsys)
+    assert code == 1
+    assert "missing required field: truststore.passwordRef.key" in out
+
+
+@pytest.mark.parametrize("command", ["validate", "search"])
+def test_malformed_yaml_is_a_clean_error(tmp_path, capsys, command):
+    path = tmp_path / "bad.yaml"
+    path.write_text("assets:\n  - id: a\n   bad: indent\n")
+    code, out = run_cli([command, str(path)], capsys)
+    assert code == 1
+    assert out.startswith("error: invalid YAML:")
+    assert "line 3" in out
+
+
 def test_validate_missing_file_is_a_clean_error(tmp_path, capsys):
     code, out = run_cli(["validate", str(tmp_path / "missing.yaml")], capsys)
     assert code == 1
@@ -89,6 +111,59 @@ def test_validate_legacy_flat_list(tmp_path, capsys):
     code, out = run_cli(["validate", cfg], capsys)
     assert code == 0
     assert "Asset ID:  legacy" in out
+
+
+# --- notes -----------------------------------------------------------------------------
+
+def notes_inventory(tmp_path):
+    return write_yaml(tmp_path, [
+        {"id": "a", "namespace": "ns", "cn": "a.example.com", "certType": "pem",
+         "notes": {"owner": "team-x", "mtls": "possible, check client-auth"}},
+        {"id": "b", "namespace": "ns", "cn": "b.example.com", "certType": "pem"},
+    ])
+
+
+def test_notes_become_csv_columns_discover_keys_first(tmp_path, capsys):
+    import csv, io
+    path = notes_inventory(tmp_path)
+    for command in ("validate", "search"):
+        code, out = run_cli([command, path, "--format", "csv"], capsys)
+        assert code == 0
+        reader = csv.DictReader(io.StringIO(out))
+        cols = reader.fieldnames
+        # discover's keys (mtls) before hand-written ones (owner)
+        assert cols.index("notes_mtls") < cols.index("notes_owner")
+        rows = {r["id"]: r for r in reader}
+        assert rows["a"]["notes_owner"] == "team-x"
+        assert rows["a"]["notes_mtls"] == "possible, check client-auth"
+        assert rows["b"]["notes_owner"] == ""
+
+
+def test_notes_in_table_and_list(tmp_path, capsys):
+    path = notes_inventory(tmp_path)
+    code, out = run_cli(["validate", path, "--format", "table"], capsys)
+    assert out.splitlines()[0].split()[-1] == "NOTES"
+    assert "mtls, owner" in out
+    code, out = run_cli(["validate", path], capsys)
+    assert "Note owner: team-x" in out
+
+
+def test_no_notes_no_columns(capsys):
+    import csv, io
+    code, out = run_cli(["search", EXAMPLE_CFG, "--format", "csv"], capsys)
+    assert not any(c.startswith("notes") for c in csv.DictReader(io.StringIO(out)).fieldnames)
+
+
+@pytest.mark.parametrize("notes, error", [
+    ("just text", "must be a dictionary"),
+    ({"bad key": "x"}, "only letters, digits and _"),
+    ({"k": ["a", "b"]}, "single value"),
+])
+def test_notes_schema(tmp_path, capsys, notes, error):
+    path = write_yaml(tmp_path, [{"id": "a", "namespace": "ns", "cn": "a", "certType": "pem", "notes": notes}])
+    code, out = run_cli(["validate", path], capsys)
+    assert code == 1
+    assert error in out
 
 
 # --- search ---------------------------------------------------------------------
@@ -116,7 +191,7 @@ def test_analyse_output_is_human_readable(capsys):
     assert code == 0
     assert "  san: DNS:test.example.com, DNS:*.example.com" in out
     assert "  eku: serverAuth, clientAuth" in out
-    assert "mTLS candidate: True" in out
+    assert "mTLS candidate: True (clientAuth in EKU)" in out
     assert "<DNSName" not in out and "ObjectIdentifier" not in out
 
 

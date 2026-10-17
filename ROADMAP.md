@@ -10,7 +10,7 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 - `cert_format(data, path, optional_password)` — probes raw bytes: PEM → DER → JKS/JCEKS (magic number) → PKCS12
 - `cert_metadata_extract(data, cert_type, optional_password)` — returns subject, issuer, serial, validity, SANs, EKU
-- `eku_inspect(metadata)` — flags mTLS candidates (serverAuth + clientAuth)
+- `mtls_candidate(metadata)` → `(bool, reason)` — mTLS client hint from the **leaf** EKU only: `clientAuth`, or no EKU extension (RFC 5280: any usage), makes it a candidate; an EKU without `clientAuth`, a CA, or no leaf (truststore) does not. `eku_inspect()` is its boolean wrapper. Metadata now carries `is_ca` (Basic Constraints)
 - `_extract_cert_metadata(cert, alias, now)` — shared helper for consistent extraction; SANs rendered openssl-style (`DNS:`, `IP:`, `email:`, `URI:`, ...; `otherName:UPN:user@example.com`, hex for non-text otherName values), EKUs by short name (dotted OID when unknown), plus expiry fields
 - `expiry_warning(metadata, warn_days)` — one-line warning for expired, not-yet-valid, or soon-to-expire certs
 - `pyjks` is imported lazily: PEM/DER/PKCS12 analysis works without it
@@ -116,8 +116,9 @@ The tool does NOT store credentials. It relies on the user's existing auth conte
 connect(config_file=None, context=None)  # if config_file given, use it; otherwise in-cluster first, then kubeconfig fallback
 get_secret_key(namespace, name, key) -> bytes  # base64-decoded single key from a Secret
 get_tls_password(namespace, name, key) -> bytes  # same as get_secret_key, semantically for passwords
-list_tls_secrets(namespace) -> list[dict]      # secrets with cert-like keys (kubernetes.io/tls + Opaque with *.pem, *.crt, etc.)
-list_tls_passwords(namespace) -> list[dict]    # Opaque secrets with password-like keys
+list_secrets(namespace, api) -> list            # every Secret of a namespace, for discover (RBAC: list secrets)
+list_namespaces(api) -> list[str]               # for discover -A (RBAC: list namespaces)
+current_context(config_file=None) -> str | None # kubeconfig current context name
 ```
 
 ### RBAC
@@ -356,9 +357,20 @@ For PKCS12/JKS targets, the tool needs the keystore password to repackage. It re
 
 ---
 
-## Step 7: Auto-discovery from cluster state
+## Step 7: Auto-discovery from cluster state — DONE
 
 Scan a cluster and automatically generate a YAML asset inventory by discovering TLS-related Secrets.
+Implemented in `discover.py` + `cmd_discover`; tests in `tests/test_discover.py` (fake API) and three scenarios in `e2e/kind.sh`.
+
+### What was implemented
+
+- Content-based detection (`cert_format`) on `kubernetes.io/tls` and on Opaque keys that look like certificates by name or by content; private keys, `ca.crt` of tls Secrets and non-certificate Secret types are skipped
+- Keystore/truststore role from the key name (`trust` → truststore); pairing in the same Secret or by base name across Secrets
+- Password discovery verified by opening the store (never writes an unverified passwordRef), `TODO` placeholders with comments otherwise
+- Schema change: `truststore.passwordRef` is now optional (a PEM CA bundle has no password); validated if present
+- Findings are written to the asset's `notes` field (key → text, schema-validated, `notes_<key>` columns in csv) instead of YAML comments, so they survive in table/csv output and spreadsheets
+- `--update FILE`: append-only merge into an edited inventory. Identity = Secret references (cluster, namespace, secret, key), not ids; new assets appended as text so comments and hand edits survive; result re-parsed and compared before an atomic write; vanished Secrets reported, never removed
+- Not implemented: grouping by Deployment/StatefulSet volume mounts; updating assets already in the inventory (e.g. a password that changed Secret) — by design `--update` never modifies existing entries
 
 ### Discovery logic
 
@@ -371,7 +383,7 @@ Scan a cluster and automatically generate a YAML asset inventory by discovering 
    - Name prefix matching (`myapp-tls`, `myapp-tls-password`)
    - Labels/annotations (e.g. `cert-manager.io`)
    - Same Deployment/StatefulSet volume mounts (later)
-5. Infer mTLS if both keystore + truststore found
+5. ~~Infer mTLS if both keystore + truststore found~~ — dropped: keystore + truststore is also the normal setup for outbound TLS to a private CA, and mTLS is enforced by application/proxy config, not by Secrets. `discover` leaves `mtls` unset and writes the EKU / truststore hints as a comment. A reliable source would be Ingress `nginx.ingress.kubernetes.io/auth-tls-*` annotations referencing the Secret (future)
 
 ### Discovery output
 
@@ -379,10 +391,12 @@ Generated YAML passes `validate_config()` immediately. Includes comments marking
 
 ### Discovery CLI
 
+`discover` always reads from the cluster, so it takes no `--live` flag.
+
 ```bash
-python main.py discover --live --namespace energia-prod
-python main.py discover --live --all-namespaces
-python main.py discover --live --namespace energia-prod --output assets.yaml
+python main.py discover -n energia-prod
+python main.py discover -A --include-system --cluster-name prod-ocp
+python main.py discover -n energia-prod --output assets.yaml [--force]
 ```
 
 ---
@@ -408,6 +422,6 @@ These are smaller enhancements to the existing `cert_analysis.py` that add value
 4. **Step 4 (cross-reference map)** — the high-value feature; depends on connectivity
 5. **Step 5 (CSR generation)** — DONE (file and `--live`, subject/SAN edits, key reuse)
 6. **Step 6 (cert rotation)** — depends on cross-reference map + connectivity; the most operationally impactful feature
-7. **Step 7 (auto-discovery)** — nice bootstrapping tool; depends on connectivity
+7. **Step 7 (auto-discovery)** — DONE (`discover`)
 
 Steps 1-3 are the minimum viable product for daily use. Steps 4-5 make it genuinely valuable. Steps 6-7 make it a full lifecycle tool.
