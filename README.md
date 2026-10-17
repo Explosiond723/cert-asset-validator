@@ -171,6 +171,8 @@ e2e/kind.sh run    # scenarios with expected exit codes; log in e2e/out/run.log
 e2e/kind.sh down   # delete the cluster and e2e/out/
 ```
 
+Each scenario checks the exit code **and** the output: the messages it must print (`expect`), those it must not (`reject`), and no Python traceback, so a crash cannot pass for an expected failure. Two scenarios also look inside the results: the subject and SANs of the generated CSRs, and the `passwordRef`s written by `discover`. The harness itself is tested in `tests/test_e2e_harness.py`.
+
 It uses its own kubeconfig (`e2e/out/kubeconfig`), so `~/.kube/config` is not modified. The inventory covers OK assets, expiry warnings, YAML/cluster mismatches, a missing Secret, an RBAC denial through a limited ServiceAccount, and an unknown context.
 ## Configuration model
 
