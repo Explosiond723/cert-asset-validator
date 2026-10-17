@@ -1,5 +1,7 @@
 # cert-asset-validator
 
+[![CI](https://github.com/Explosiond723/cert-asset-validator/actions/workflows/ci.yml/badge.svg)](https://github.com/Explosiond723/cert-asset-validator/actions/workflows/ci.yml)
+
 Certificate lifecycle management for Kubernetes / OpenShift environments.
 
 ## Purpose
@@ -146,6 +148,18 @@ python -m pytest
 
 Tests live in `tests/`. They use the fixtures in `test_certs/` for format detection, and generate certificates on the fly wherever the result depends on the current date (expiry), so they do not start failing when the fixtures expire.
 
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and every push to `main`:
+
+| Job | What it checks |
+|---|---|
+| `tests` | `pytest` on Python 3.10, 3.12, 3.13, 3.14 |
+| `minimal-deps` | `pytest` with only `pyyaml` and `cryptography` installed: offline commands must work without `kubernetes` and `pyjks` (their tests are skipped) |
+| `e2e-kind` | `e2e/kind.sh up` + `run` on a kind cluster created inside the runner; the scenario log is kept as the `e2e-run-log` artifact for 14 days |
+
+It can also be started by hand from the Actions tab (`Run workflow`).
 
 ### End-to-end test with kind
 

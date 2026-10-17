@@ -1,0 +1,110 @@
+# Continuous integration for cert-asset-validator.
+#
+# Runs on every pull request and on every push to main:
+#   tests         unit/CLI tests (pytest) on every supported Python version
+#   minimal-deps  same tests without the optional packages (kubernetes, pyjks),
+#                 to prove offline commands really work without them
+#   e2e-kind      --live / discover / csr against a real API server: a throw-away
+#                 kind cluster inside the runner, driven by e2e/kind.sh
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # "Run workflow" button in the Actions tab
+
+# The workflow only reads the repository.
+permissions:
+  contents: read
+
+# A new push to the same branch/PR cancels the run still in progress for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false # keep testing the other versions when one fails
+      matrix:
+        # README: Python 3.10+ (the code uses `X | Y` type hints)
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      # pyjks depends on twofish, a C extension: the runner has a compiler and
+      # setup-python provides the Python headers, so it builds here.
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -v
+
+  minimal-deps:
+    name: tests without kubernetes and pyjks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Only the hard dependencies: tests needing the optional packages must be
+      # skipped, everything else must pass.
+      - name: Install core dependencies only
+        run: pip install pyyaml cryptography pytest
+
+      - name: Run tests
+        run: python -m pytest -v -rs # -rs lists the skipped tests and why
+
+  e2e-kind:
+    name: end-to-end on kind
+    needs: tests # no point starting a cluster if the unit tests fail
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Only installs the kind binary: e2e/kind.sh creates and configures the
+      # cluster itself (Docker and kubectl are preinstalled on the runner).
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - name: Create cluster, Secrets and inventory
+        run: e2e/kind.sh up
+
+      - name: Run scenarios
+        run: e2e/kind.sh run
+
+      # Only the log: e2e/out also holds a kubeconfig with a ServiceAccount token
+      # and generated private keys, which must not be published as artifacts.
+      - name: Upload scenario log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-run-log
+          path: e2e/out/run.log
+          if-no-files-found: ignore
+          retention-days: 14
