@@ -80,7 +80,8 @@ def cluster_secrets(make_keystore):
             secret("billing-tls", {"keystore.p12": p12("billing.example.com", b"p12pass")}),
             secret("billing-tls-pass", {"password": b"p12pass"}),
             secret("orphan-p12", {"keystore.p12": p12("orphan.example.com", b"lost")}),
-            secret("wrong-pass", {"keystore.jks": make_keystore(leaf_cn="wrong.example.com"),
+            secret("wrong-pass", {"keystore.jks": make_keystore(password="only-wrong-knows",
+                                                                leaf_cn="wrong.example.com"),
                                   "keystorePassword": b"not-the-password"}),
         ],
         "other": [
@@ -139,6 +140,50 @@ def test_missing_password_is_todo_never_guessed(cluster_secrets):
     # a password-looking key that does not open the store is not written
     wrong, _ = found["wrong-pass"]
     assert wrong["keystore"]["passwordRef"] == {"name": "TODO", "key": "TODO"}
+
+
+@pytest.mark.parametrize("password_secret, key", [
+    ("billing-pwd", "password"),
+    ("billing-password", "password"),
+    ("billing.password", "password"),
+    ("billing-tls-pw", "password"),
+    ("billing-keystore-pass", "password"),
+    ("billing-creds", "keystore-pw"),
+    ("billing-ssl-passphrase", "value"),    # any key of a Secret related by name
+    ("pwd-billing", "password"),            # base name as suffix
+    ("app-passwords", "billing"),           # shared password Secret, key named after the app
+])
+def test_password_secret_naming_variants(password_secret, key):
+    secrets = [secret("billing-tls", {"keystore.p12": p12("b.example.com", b"Xy9-unique")}),
+               secret(password_secret, {key: b"Xy9-unique"})]
+    (asset, notes), = discover.discover_namespace("ns", secrets, None, set())
+    assert asset["keystore"]["passwordRef"] == {"name": password_secret, "key": key}
+    assert not any("not related" in n for n in notes)
+
+
+def test_password_from_unrelated_secret_is_flagged(make_keystore):
+    # two apps sharing the default password: found, but the reference is suspicious
+    secrets = [secret("billing-tls", {"keystore.jks": make_keystore(leaf_cn="b.example.com")}),
+               secret("orders-config", {"keystorePassword": b"changeit"})]
+    (asset, notes), = discover.discover_namespace("ns", secrets, None, set())
+    assert asset["keystore"]["passwordRef"] == {"name": "orders-config", "key": "keystorePassword"}
+    assert any("not related by name" in n for n in notes)
+
+
+def test_related_secret_wins_over_unrelated_with_same_password(make_keystore):
+    secrets = [secret("billing-tls", {"keystore.jks": make_keystore(leaf_cn="b.example.com")}),
+               secret("a-unrelated", {"keystorePassword": b"changeit"}),
+               secret("billing-pwd", {"value": b"changeit"})]
+    (asset, notes), = discover.discover_namespace("ns", secrets, None, set())
+    assert asset["keystore"]["passwordRef"] == {"name": "billing-pwd", "key": "value"}
+    assert not any("not related" in n for n in notes)
+
+
+def test_unrelated_name_with_base_in_the_middle_is_not_related():
+    assert not discover._related_by_name("billing", "old-billing-pwd-backup-x")
+    assert discover._related_by_name("billing", "billing-tls-pw")
+    assert not discover._related_by_name("billing", "billing")
+    assert not discover._related_by_name("billing", "billing-config")
 
 
 def test_truststore_secret_attached_by_base_name(cluster_secrets):
