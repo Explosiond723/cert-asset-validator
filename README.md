@@ -76,6 +76,12 @@ python main.py validate inventory.yaml --live
 
 # Later: add only the Secrets that are new, keeping every hand edit and comment
 python main.py discover -A --update inventory.yaml
+
+# Cross-reference map: where each certificate lives, which CAs signed what, chains and trust
+python main.py map inventory.yaml
+python main.py map inventory.yaml --view cas
+python main.py map inventory.yaml --cn api.example.com --view certificates
+python main.py map inventory.yaml --view assets --format csv > relationships.csv
 ```
 
 Running `python main.py` with no arguments prints usage help.
@@ -110,12 +116,16 @@ Running `python main.py` with no arguments prints usage help.
     - only new assets are appended, as text, at the end of the `assets` list with the same indentation: the rest of the file stays byte for byte, comments included
     - the result is re-parsed before writing (it must contain exactly the old assets plus the new ones) and written atomically; if appending is not safe (e.g. `assets` is not the last section) nothing is written
     - the cluster must already be in the `clusters` section (matched by kubeconfig context, or `--cluster-name`); assets whose Secrets disappeared are listed, never removed
+- **Cross-reference map** (`map`) — reads the real certificates (always connects, like `discover`) and shows three views (`--view certificates|cas|assets`, all by default; `table`/`csv` need one view):
+  - **certificates**: each asset certificate with every place it lives (same SHA-256 fingerprint), and a warning when the **same name exists as different certificates** — typically a renewal applied in one place but not in another
+  - **cas**: every CA in the inventory with the certificates it signed, who trusts it (truststores) and whose chain carries it; issuers that appear nowhere in the inventory are listed too. Certificates are linked to their CA by key identifier (AKI/SKI), with the DN as fallback, so a renewed CA with the same name is told apart (and flagged)
+  - **assets**: per asset, whether the keystore chain contains the issuing CA, whether the truststore trusts the asset's own CA, which trusted CAs sign nothing in the inventory, and which other assets use the same certificate
+  - `--cn` limits the map to assets whose YAML cn or real CN/SANs match; exit 1 if any asset could not be read
 - **Notes** (`notes:` on an asset, optional) — free-form `key: text` pairs, written by `discover` and editable by hand (e.g. `owner: team-payments`). In `--format csv` every key becomes a `notes_<key>` column, ready for spreadsheet filtering; `table` shows a `notes` column listing the keys; `validate` (list) prints them
 - **Output formats** (`--format list|table|csv` on `validate`, `search` and `analyse`) — `list` is the default human-readable layout; `table` is an aligned view; `csv` carries every field, one row per asset or certificate, multi-value cells joined with `; `
 
 ### Planned
 
-- **Cross-reference map** — show where the same cert lives across locations, CA inventory, keystore+truststore relationship analysis
 - **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
 - **Cert rotation** with `--live` — push a renewed certificate into every Secret where it lives
 

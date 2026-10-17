@@ -212,6 +212,22 @@ def _extract_cert_metadata(cert, alias: str = None, now: datetime = None) -> dic
     except ExtensionNotFound:
         metadata["is_ca"] = False
 
+    # Identity and issuer linkage, used by `map`: the SHA-256 fingerprint identifies the exact
+    # certificate (same value as `openssl x509 -fingerprint -sha256`, without colons); the
+    # key identifiers link a cert to the CA that signed it even when a renewed CA keeps the
+    # same subject DN.
+    metadata["fingerprint_sha256"] = cert.fingerprint(hashes.SHA256()).hex()
+    try:
+        metadata["subject_key_id"] = cert.extensions.get_extension_for_class(
+            x509.SubjectKeyIdentifier).value.digest.hex()
+    except ExtensionNotFound:
+        metadata["subject_key_id"] = None
+    try:
+        aki = cert.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value.key_identifier
+        metadata["authority_key_id"] = aki.hex() if aki else None
+    except ExtensionNotFound:
+        metadata["authority_key_id"] = None
+
     try:
         eku_ext = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
         metadata["eku"] = [_format_oid(eku) for eku in eku_ext.value]

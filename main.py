@@ -592,6 +592,43 @@ def update_inventory(path: str, existing: dict, discovered: list, cluster_name, 
     return summary
 
 
+# cmd_map builds the cross-reference map of the certificates behind the inventory (see
+# certmap.py). Like discover it always reads from the clusters: offline there is nothing
+# to map. With --cn, only assets whose YAML cn or real CN/SANs match are mapped.
+def cmd_map(args):
+    import certmap
+    from live import inspect_asset, live_matches_cn
+
+    cfg = load_config(args.config)
+    clusters, assets = cfg["clusters"], cfg["assets"]
+    cluster_names = []
+    for cluster_def in clusters:
+        validate_cluster(cluster_def)
+        cluster_names.append(cluster_def["name"])
+    for i, asset in enumerate(assets):
+        asset_id = asset.get("id", f"asset[{i}]") if isinstance(asset, dict) else f"asset[{i}]"
+        try:
+            validate_config(asset, cluster_names)
+        except ValueError as ve:
+            raise ValueError(f"{asset_id}: {ve}")
+
+    clients = make_live_clients(args, clusters)
+    pairs = [(asset, inspect_asset(asset, clients, args.warn_days)) for asset in assets]
+    if args.cn:
+        pairs = [(a, r) for a, r in pairs if live_matches_cn(a, r, args.cn)]
+
+    report = certmap.build_map(pairs, args.warn_days)
+    if args.format == "list":
+        views = ["certificates", "cas", "assets"] if args.view == "all" else [args.view]
+        certmap.print_map(report, views)
+    else:
+        rows, columns = certmap.table_rows(report, args.view)
+        render_rows(rows, columns, args.format)
+
+    if any(r["errors"] for _, r in pairs):
+        sys.exit(1)
+
+
 # cmd_search is a simple filter that loads the YAML config and prints assets that match the provided filters.
 # This is useful for quickly finding assets in a large inventory without needing to use `kubectl` or query the cluster directly.
 def cmd_search(args):
@@ -799,6 +836,21 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument("--force", action="store_true", help="Overwrite --output if it exists")
     discover_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
 
+    # `python main.py map <config> [--view certificates|cas|assets] [--cn TEXT]`
+    # Cross-reference map of the real certificates: where the same certificate lives, which
+    # CAs signed what and who trusts them, chain/truststore relationships per asset.
+    map_parser = subparsers.add_parser("map", help="Cross-reference map of the certificates in the clusters")
+    map_parser.add_argument("config", metavar="CONFIGFILE", help="Path to YAML config file")
+    map_parser.add_argument("--view", choices=["all", "certificates", "cas", "assets"], default="all",
+                            help="Which part of the map to show (default: all; table/csv need a single view)")
+    map_parser.add_argument("--cn", help="Only assets whose YAML cn or real CN/SANs contain this text")
+    map_parser.add_argument("--context", help="Use this kubeconfig context for all clusters")
+    map_parser.add_argument("--kubeconfig", metavar="PATH", help="Path to a kubeconfig file")
+    map_parser.add_argument("--warn-days", type=non_negative_int, default=30, metavar="DAYS",
+                            help="Flag certificates expiring within DAYS days (default: 30)")
+    add_format_argument(map_parser)
+    map_parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable verbose output (show INFO-level log messages)")
+
     # Global flag (applies to all subcommands): -v / --verbose
     # The subcommand copies of -v use default=argparse.SUPPRESS: otherwise their default
     # (False) would overwrite a -v given before the subcommand (`main.py -v analyse ...`).
@@ -810,6 +862,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {
+    "map": cmd_map,
     "discover": cmd_discover,
     "validate": cmd_validate,
     "analyse": cmd_analyse,
@@ -832,7 +885,7 @@ def main(argv: list[str] = None) -> None:
         parser.print_help()
         return
 
-    if args.command != "discover" and not getattr(args, "live", False) and (getattr(args, "context", None) or getattr(args, "kubeconfig", None)):
+    if args.command not in ("discover", "map") and not getattr(args, "live", False) and (getattr(args, "context", None) or getattr(args, "kubeconfig", None)):
         parser.error("--context and --kubeconfig require --live")
     if args.command == "csr":
         if args.live and not args.id:
@@ -845,6 +898,8 @@ def main(argv: list[str] = None) -> None:
             parser.error("--key-output is not used when an existing key is reused")
         if args.key_password and not args.key:
             parser.error("--key-password requires --key")
+    if args.command == "map" and args.format != "list" and args.view == "all":
+        parser.error("--format table/csv shows one view at a time: add --view certificates, cas or assets")
     if args.command == "discover" and args.include_system and not args.all_namespaces:
         parser.error("--include-system requires --all-namespaces")
     if args.command in ("validate", "search") and args.fail_on_expiry and not args.live:
