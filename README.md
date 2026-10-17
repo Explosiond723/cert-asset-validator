@@ -71,6 +71,9 @@ python main.py search example-cfg.yaml --live --context kind-test --kubeconfig ~
 python main.py discover -n energia-prod -n billing-prod --output inventory.yaml
 python main.py discover -A --context prod-ocp-admin --cluster-name prod-ocp --output inventory.yaml
 python main.py validate inventory.yaml --live
+
+# Later: add only the Secrets that are new, keeping every hand edit and comment
+python main.py discover -A --update inventory.yaml
 ```
 
 Running `python main.py` with no arguments prints usage help.
@@ -100,6 +103,11 @@ Running `python main.py` with no arguments prints usage help.
   - reads `cn` from the certificate; notes cert-manager ownership and expiry as comments
   - `-A` skips `kube-*`, `openshift*` and `default` unless `--include-system`; a namespace that cannot be listed is reported and skipped (exit 1, partial inventory still written)
   - never writes secret values; `--output` refuses to overwrite an existing file without `--force`
+  - `--update FILE` keeps an inventory up to date after you edited it by hand (filled TODOs, fixed a `passwordRef`, renamed ids, added notes and comments):
+    - an asset is recognised by the Secrets it points to (cluster + namespace + Secret + key of keystore or truststore), not by its id, so renamed assets are not duplicated
+    - only new assets are appended, as text, at the end of the `assets` list with the same indentation: the rest of the file stays byte for byte, comments included
+    - the result is re-parsed before writing (it must contain exactly the old assets plus the new ones) and written atomically; if appending is not safe (e.g. `assets` is not the last section) nothing is written
+    - the cluster must already be in the `clusters` section (matched by kubeconfig context, or `--cluster-name`); assets whose Secrets disappeared are listed, never removed
 - **Notes** (`notes:` on an asset, optional) — free-form `key: text` pairs, written by `discover` and editable by hand (e.g. `owner: team-payments`). In `--format csv` every key becomes a `notes_<key>` column, ready for spreadsheet filtering; `table` shows a `notes` column listing the keys; `validate` (list) prints them
 - **Output formats** (`--format list|table|csv` on `validate`, `search` and `analyse`) — `list` is the default human-readable layout; `table` is an aligned view; `csv` carries every field, one row per asset or certificate, multi-value cells joined with `; `
 

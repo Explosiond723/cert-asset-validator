@@ -380,3 +380,140 @@ def test_system_namespace_filter():
     assert main.is_system_namespace("openshift-ingress")
     assert not main.is_system_namespace("defaultapp")
     assert not main.is_system_namespace("web-prod")
+
+
+# --- discover --update ------------------------------------------------------------------
+
+HAND_EDITED = """\
+# Inventory of the payments team. Edited by hand: keep this comment!
+clusters:
+  - name: prod
+    context: kind-test   # same context as the fake cluster
+
+assets:
+  # web certificate, renewed every 90 days by cert-manager
+  - id: www-frontend          # renamed by hand (discover called it web-tls)
+    cluster: prod
+    namespace: web-prod
+    cn: www.example.com
+    certType: pem
+    keystore: {secret: {name: web-tls, key: tls.crt}}
+    notes:
+      owner: team-web
+  - id: gone-app
+    cluster: prod
+    namespace: web-prod
+    cn: gone.example.com
+    certType: pem
+    keystore: {secret: {name: removed-tls, key: tls.crt}}
+"""
+
+
+def write_inventory(tmp_path, text=HAND_EDITED):
+    path = tmp_path / "inventory.yaml"
+    path.write_text(text)
+    return path
+
+
+def test_update_appends_only_new_assets_and_keeps_the_file(fake_discover, tmp_path, capsys):
+    path = write_inventory(tmp_path)
+    code, out, err = run_discover(["-n", "web-prod", "--update", str(path)], capsys)
+    assert code == 0, err
+    assert out == ""
+    text = path.read_text()
+
+    # everything that was there is still there, byte for byte, comments included
+    assert text.startswith(HAND_EDITED)
+    inv = yaml.safe_load(text)
+    ids = [a["id"] for a in inv["assets"]]
+    assert ids[:2] == ["www-frontend", "gone-app"]
+    # web-tls is recognised by its Secret reference although its id was renamed
+    assert "web-tls" not in ids
+    assert {"myapp-tls", "lonely-ca"} <= set(ids)
+    assert all(a["cluster"] == "prod" for a in inv["assets"])
+    assert "added by `main.py discover --update`" in text
+
+    assert "new asset(s) appended" in err and "1 already in the inventory" in err
+    assert "not found in the cluster any more (kept in the file): gone-app" in err
+    assert run_cli(["validate", str(path)], capsys)[0] == 0
+
+
+def test_update_twice_is_a_no_op(fake_discover, tmp_path, capsys):
+    path = write_inventory(tmp_path)
+    run_discover(["-n", "web-prod", "--update", str(path)], capsys)
+    after_first = path.read_text()
+    code, _, err = run_discover(["-n", "web-prod", "--update", str(path)], capsys)
+    assert code == 0
+    assert path.read_text() == after_first
+    assert "no new assets" in err and "unchanged" in err
+
+
+def test_update_new_ids_do_not_collide_with_existing(fake_discover, tmp_path, capsys):
+    path = write_inventory(tmp_path, HAND_EDITED.replace("id: gone-app", "id: myapp-tls"))
+    run_discover(["-n", "web-prod", "--update", str(path)], capsys)
+    ids = [a["id"] for a in yaml.safe_load(path.read_text())["assets"]]
+    assert len(ids) == len(set(ids))
+    assert "myapp-tls.web-prod" in ids
+
+
+def test_update_cluster_must_exist_in_the_file(fake_discover, tmp_path, capsys):
+    path = write_inventory(tmp_path)
+    fake_discover["context"] = "other-context"
+    code, out, _ = run_discover(["-n", "web-prod", "--update", str(path)], capsys)
+    assert code == 1
+    assert "no cluster in" in out and "other-context" in out
+    assert path.read_text() == HAND_EDITED
+
+    code, out, _ = run_discover(["-n", "web-prod", "--update", str(path), "--cluster-name", "nope"], capsys)
+    assert code == 1 and "cluster 'nope' is not defined" in out
+
+    code, _, _ = run_discover(["-n", "web-prod", "--update", str(path), "--cluster-name", "prod"], capsys)
+    assert code == 0
+
+
+@pytest.mark.parametrize("text", [
+    # legacy flat list, items at column 0
+    "- id: old\n  namespace: web-prod\n  cn: old.example.com\n  certType: pem\n"
+    "  keystore: {secret: {name: removed-tls, key: tls.crt}}\n",
+    # empty flow list
+    "# empty for now\nassets: []\n",
+    # block list with items at column 0 under assets:
+    "assets:\n- id: old\n  namespace: web-prod\n  cn: old.example.com\n  certType: pem\n"
+    "  keystore: {secret: {name: removed-tls, key: tls.crt}}\n",
+])
+def test_update_layouts(fake_discover, tmp_path, capsys, text):
+    path = write_inventory(tmp_path, text)
+    code, _, err = run_discover(["-n", "web-prod", "--update", str(path)], capsys)
+    assert code == 0, err
+    new_text = path.read_text()
+    assert new_text.startswith(text.rstrip("\n").replace("assets: []", "assets:"))
+    assert run_cli(["validate", str(path)], capsys)[0] == 0
+    # no clusters section in these files: appended assets carry no cluster field
+    inv = main.normalize_config(yaml.safe_load(new_text))
+    assert all("cluster" not in a for a in inv["assets"])
+
+
+def test_update_refuses_when_assets_is_not_the_last_section(fake_discover, tmp_path, capsys):
+    text = ("assets:\n  - id: old\n    namespace: web-prod\n    cn: old.example.com\n    certType: pem\n"
+            "    keystore: {secret: {name: removed-tls, key: tls.crt}}\n"
+            "clusters: []\n")
+    path = write_inventory(tmp_path, text)
+    code, out, _ = run_discover(["-n", "web-prod", "--update", str(path)], capsys)
+    assert code == 1
+    assert "cannot append safely" in out
+    assert path.read_text() == text
+    assert not (tmp_path / "inventory.yaml.tmp").exists()
+
+
+def test_update_refuses_an_invalid_inventory_before_scanning(fake_discover, tmp_path, capsys):
+    path = write_inventory(tmp_path, "assets:\n  - id: broken\n")
+    fake_discover["api"] = None  # scanning would crash: proves the file is checked first
+    code, out, _ = run_discover(["-n", "web-prod", "--update", str(path)], capsys)
+    assert code == 1
+    assert "is not valid, fix it before --update" in out
+
+
+def test_update_and_output_are_exclusive(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        main.main(["discover", "-n", "x", "--update", "a.yaml", "--output", "b.yaml"])
+    assert exc.value.code == 2

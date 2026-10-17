@@ -246,6 +246,9 @@ run() {
             --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --output discovered.yaml --force
         scenario 0 "validate --live on the discovered inventory (passwords found and verified, warnings only)" \
             "${main[@]}" validate "$OUT/discovered.yaml" "${live[@]}" --format table
+        scenario 0 "discover --update on the same namespaces: nothing new, file unchanged" \
+            "${main[@]}" discover -n web-prod -n api-prod -n billing-prod \
+            --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --update discovered.yaml
         scenario 1 "discover with the limited identity: web-prod readable, api-prod denied" \
             "${main[@]}" discover -n web-prod -n api-prod --kubeconfig "$KCFG" --context "$LIMITED_CTX"
         scenario 0 "analyse the generated CSR inputs: JKS keystore from disk" \

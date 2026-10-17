@@ -88,6 +88,16 @@ def test_validate_truststore_password_ref_is_optional_but_checked(tmp_path, caps
     assert "missing required field: truststore.passwordRef.key" in out
 
 
+@pytest.mark.parametrize("command", ["validate", "search"])
+def test_malformed_yaml_is_a_clean_error(tmp_path, capsys, command):
+    path = tmp_path / "bad.yaml"
+    path.write_text("assets:\n  - id: a\n   bad: indent\n")
+    code, out = run_cli([command, str(path)], capsys)
+    assert code == 1
+    assert out.startswith("error: invalid YAML:")
+    assert "line 3" in out
+
+
 def test_validate_missing_file_is_a_clean_error(tmp_path, capsys):
     code, out = run_cli(["validate", str(tmp_path / "missing.yaml")], capsys)
     assert code == 1

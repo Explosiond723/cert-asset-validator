@@ -369,7 +369,8 @@ Implemented in `discover.py` + `cmd_discover`; tests in `tests/test_discover.py`
 - Password discovery verified by opening the store (never writes an unverified passwordRef), `TODO` placeholders with comments otherwise
 - Schema change: `truststore.passwordRef` is now optional (a PEM CA bundle has no password); validated if present
 - Findings are written to the asset's `notes` field (key → text, schema-validated, `notes_<key>` columns in csv) instead of YAML comments, so they survive in table/csv output and spreadsheets
-- Not implemented: grouping by Deployment/StatefulSet volume mounts; merging into an existing inventory (discover writes a new file)
+- `--update FILE`: append-only merge into an edited inventory. Identity = Secret references (cluster, namespace, secret, key), not ids; new assets appended as text so comments and hand edits survive; result re-parsed and compared before an atomic write; vanished Secrets reported, never removed
+- Not implemented: grouping by Deployment/StatefulSet volume mounts; updating assets already in the inventory (e.g. a password that changed Secret) — by design `--update` never modifies existing entries
 
 ### Discovery logic
 

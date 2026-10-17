@@ -362,6 +362,12 @@ def _mtls_note(leaf, has_truststore: bool):
             "set it from the application config, e.g. client-auth=need")
 
 
+def _asset_lines(asset: dict, comments: list[str], indent: str) -> list[str]:
+    lines = [""] + [f"{indent}# {comment}" for comment in comments]
+    dumped = yaml.safe_dump([asset], sort_keys=False, default_flow_style=False, width=1000)
+    return lines + [indent + line if line else line for line in dumped.rstrip("\n").split("\n")]
+
+
 # render_inventory writes the discovered assets as YAML. PyYAML cannot emit comments,
 # so each asset is dumped on its own and preceded by its comment lines.
 def render_inventory(cluster_name: str, context: str, discovered: list[tuple[dict, list[str]]],
@@ -373,8 +379,56 @@ def render_inventory(cluster_name: str, context: str, discovered: list[tuple[dic
                   f"    context: {json.dumps(context)}", ""]
     lines.append("assets:" if discovered else "assets: []")
     for asset, comments in discovered:
-        lines.append("")
-        lines += [f"  # {comment}" for comment in comments]
-        dumped = yaml.safe_dump([asset], sort_keys=False, default_flow_style=False, width=1000)
-        lines += ["  " + line if line else line for line in dumped.rstrip("\n").split("\n")]
+        lines += _asset_lines(asset, comments, "  ")
     return "\n".join(lines) + "\n"
+
+
+# asset_refs returns the Secret keys an asset points to, as (cluster, namespace, secret, key)
+# for its keystore and truststore. This is how `discover --update` recognises an asset that
+# is already in the inventory: ids can be renamed by hand, Secret references cannot change
+# without the asset becoming a different one.
+def asset_refs(asset: dict) -> set:
+    refs = set()
+    if not isinstance(asset, dict):
+        return refs
+    for role in ("keystore", "truststore"):
+        secret = (asset.get(role) or {}).get("secret") if isinstance(asset.get(role), dict) else None
+        if isinstance(secret, dict):
+            refs.add((asset.get("cluster"), asset.get("namespace"), secret.get("name"), secret.get("key")))
+    return refs
+
+
+_ASSETS_LINE = re.compile(r"^assets:\s*(\[\s*\])?\s*(#.*)?$")
+_ITEM_LINE = re.compile(r"^(\s*)- ")
+
+
+# append_assets adds new assets at the end of an existing inventory *as text*, so that
+# everything already in the file (hand edits, comments, formatting, key order) is kept
+# byte for byte; rewriting it with PyYAML would drop every comment. The new items use the
+# indentation of the existing ones. Raises ValueError when the layout does not allow a safe
+# append; the caller re-parses the result anyway before writing it.
+def append_assets(text: str, new: list[tuple[dict, list[str]]], header: list[str], legacy_list: bool) -> str:
+    lines = text.rstrip("\n").split("\n")
+    if legacy_list:
+        start = -1  # top-level list: items start anywhere in the file
+    else:
+        starts = [i for i, line in enumerate(lines) if _ASSETS_LINE.match(line)]
+        if len(starts) != 1:
+            raise ValueError("cannot find a single top-level 'assets:' line to append to")
+        start = starts[0]
+        if lines[start].split("#")[0].rstrip().endswith("[]"):
+            lines[start] = "assets:"  # empty flow list -> block list
+
+    indent = None
+    for line in lines[start + 1:]:
+        match = _ITEM_LINE.match(line)
+        if match:
+            indent = match.group(1)
+            break
+    if indent is None:
+        indent = "" if legacy_list else "  "
+
+    block = [""] + [f"{indent}# {h}" for h in header]
+    for asset, comments in new:
+        block += _asset_lines(asset, comments, indent)
+    return "\n".join(lines + block) + "\n"
