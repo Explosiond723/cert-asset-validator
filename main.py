@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import re
 import sys
 import yaml
 from cert_analysis import cert_format, cert_metadata_extract, mtls_candidate, csr_generate, expiry_warning
@@ -133,6 +134,17 @@ def validate_config(cfg: dict, cluster_names: list[str]) -> None:
     if "mtls" in cfg and not isinstance(cfg["mtls"], bool):
         raise ValueError("field 'mtls' must be boolean")
 
+    # notes optional: free-form key -> text, written by discover and editable by hand.
+    # Each key becomes a notes_<key> column in csv output.
+    if "notes" in cfg:
+        if not isinstance(cfg["notes"], dict):
+            raise ValueError("field 'notes' must be a dictionary (key: text)")
+        for key, value in cfg["notes"].items():
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_]+", key):
+                raise ValueError(f"notes key '{key}' must contain only letters, digits and _")
+            if isinstance(value, (dict, list)):
+                raise ValueError(f"notes.{key} must be a single value, not a list or dictionary")
+
 
 # make_live_clients prepares cluster access for --live. clusters is the validated
 # clusters section; each asset is routed to its cluster's kubeconfig context.
@@ -140,6 +152,32 @@ def make_live_clients(args, clusters: list[dict]):
     from live import ClusterClients
     contexts = {c["name"]: c["context"] for c in clusters}
     return ClusterClients(contexts, kubeconfig=args.kubeconfig, context_override=args.context)
+
+
+# Notes written by discover come first, in this order; other (hand-written) keys follow
+# alphabetically.
+NOTE_KEY_ORDER = ("mtls", "keystore_password", "truststore_password", "cn", "managed_by", "content")
+
+
+def note_keys(assets: list[dict]) -> list[str]:
+    keys = {k for a in assets if isinstance(a, dict) for k in (a.get("notes") or {})}
+    return [k for k in NOTE_KEY_ORDER if k in keys] + sorted(keys - set(NOTE_KEY_ORDER))
+
+
+# note_fields returns the notes of an asset as output columns: one notes_<key> column per
+# key in csv (full text, for spreadsheets), a single `notes` column listing the keys in
+# table (full text does not fit a terminal).
+def note_fields(asset: dict, keys: list[str], fmt: str) -> dict:
+    notes = (asset or {}).get("notes") or {}
+    if fmt == "csv":
+        return {f"notes_{k}": notes.get(k) for k in keys}
+    return {"notes": ", ".join(k for k in keys if k in notes)}
+
+
+def note_columns(keys: list[str], fmt: str) -> list[str]:
+    if not keys:
+        return []
+    return [f"notes_{k}" for k in keys] if fmt == "csv" else ["notes"]
 
 
 # live_row_fields returns the columns `--live` adds to table/csv output for one asset.
@@ -193,15 +231,18 @@ def cmd_validate(args):
         print_validate_list(clusters, cluster_names, records, results)
     else:
         rows = []
+        keys = note_keys([cfg for _, cfg, _ in records])
         for asset_id, cfg, error in records:
             cfg = cfg or {}
             row = {"id": asset_id, "valid": "no" if error else "yes", "error": error,
                    "cluster": cfg.get("cluster"), "namespace": cfg.get("namespace"), "cn": cfg.get("cn"),
                    "certType": cfg.get("certType"), "mtls": cfg.get("mtls", False) if cfg else None}
+            row.update(note_fields(cfg, keys, args.format))
             if args.live:
                 row.update(live_row_fields(results[asset_id]) if asset_id in results else {})
             rows.append(row)
         columns = ["id", "valid", "error", "cluster", "namespace", "cn", "certType", "mtls"]
+        columns += note_columns(keys, args.format)
         if args.live:
             columns += ["live_subject", "not_valid_after", "days_remaining", "expiry", "san", "warnings", "errors"]
         render_rows(rows, columns, args.format)
@@ -227,6 +268,8 @@ def print_validate_list(clusters, cluster_names, records, results) -> None:
         print("CN:      ", cfg["cn"])
         print("certType: ", cfg["certType"])
         print("mTLS:     ", cfg.get("mtls", False))
+        for key, value in (cfg.get("notes") or {}).items():
+            print(f"Note {key}: {value}")
         print("----")
     if results:
         from live import print_inspection
@@ -482,9 +525,11 @@ def cmd_search(args):
 
     if args.format != "list":
         rows = []
+        keys = note_keys(assets)
         for asset in assets:
             row = {"id": asset["id"], "cluster": asset.get("cluster", ""), "namespace": asset["namespace"],
                    "cn": asset["cn"], "certType": asset["certType"]}
+            row.update(note_fields(asset, keys, args.format) if keys else {})
             if args.live:
                 row.update(live_row_fields(results[asset["id"]]))
             rows.append(row)

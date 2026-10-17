@@ -254,7 +254,10 @@ def _store_ref(secret_name: str, store: dict, password_ref) -> dict:
 
 
 # discover_namespace turns the Secrets of one namespace into inventory assets.
-# Returns a list of (asset dict, notes list). Never includes secret values.
+# Returns a list of (asset dict, comment lines). Findings meant for people (mtls hint,
+# password not found, ...) go in the asset's `notes` field so they survive in table/csv
+# output; comments only carry volatile information (subject, expiry).
+# Never includes secret values.
 def discover_namespace(namespace: str, secrets: list, cluster_name: str, used_ids: set) -> list[tuple[dict, list[str]]]:
     by_name = {s.metadata.name: s for s in secrets}
     found = []  # (secret, stores)
@@ -295,18 +298,18 @@ def discover_namespace(namespace: str, secrets: list, cluster_name: str, used_id
         name = secret.metadata.name
         if name in attached or any(st["role"] == "keystore" for st in stores):
             continue
-        asset, notes = _build_asset(namespace, cluster_name, secret, stores[0], [], False, by_name, used_ids)
-        notes.insert(0, "truststore only (CA bundle), no keystore found for it")
-        results.append((asset, notes))
+        asset, comments = _build_asset(namespace, cluster_name, secret, stores[0], [], False, by_name, used_ids)
+        asset["notes"] = {"content": "truststore only (CA bundle), no keystore found for it", **asset.get("notes", {})}
+        results.append((asset, comments))
     return results
 
 
 def _build_asset(namespace, cluster_name, secret, ks, truststores, multiple, by_name, used_ids):
     name = secret.metadata.name
-    notes = []
+    notes = {}
     metas, ks_pass, note = _open_store(secret, ks, by_name)
     if note:
-        notes.append(f"keystore: {note}")
+        notes["keystore_password"] = note
     leaf = _leaf(metas)
 
     asset = {"id": _asset_id(name, namespace, ks["key"], multiple, used_ids)}
@@ -317,7 +320,7 @@ def _build_asset(namespace, cluster_name, secret, ks, truststores, multiple, by_
         asset["cn"] = leaf["common_name"]
     else:
         asset["cn"] = "TODO"
-        notes.append("cn: could not be read from the certificate, fill it in")
+        notes["cn"] = "could not be read from the certificate, fill it in"
     asset["certType"] = FORMAT_CERT_TYPE[ks["format"]]
     asset["keystore"] = _store_ref(name, ks, ks_pass)
 
@@ -326,19 +329,21 @@ def _build_asset(namespace, cluster_name, secret, ks, truststores, multiple, by_
         ts_secret = ts.get("secret", secret)
         _ts_metas, ts_pass, ts_note = _open_store(ts_secret, ts, by_name)
         if ts_note:
-            notes.append(f"truststore: {ts_note}")
+            notes["truststore_password"] = ts_note
         asset["truststore"] = _store_ref(ts_secret.metadata.name, ts, ts_pass)
 
     note = _mtls_note(leaf, bool(truststores))
     if note:
-        notes.append(note)
+        notes["mtls"] = note
 
     annotations = secret.metadata.annotations or {}
     if "cert-manager.io/certificate-name" in annotations:
-        notes.append(f"managed by cert-manager (Certificate '{annotations['cert-manager.io/certificate-name']}')")
-    if leaf:
-        notes.append(f"{leaf['subject']}, {leaf['expiry']}")
-    return asset, notes
+        notes["managed_by"] = f"cert-manager (Certificate '{annotations['cert-manager.io/certificate-name']}')"
+
+    if notes:
+        asset["notes"] = notes
+    comments = [f"{leaf['subject']}, {leaf['expiry']}"] if leaf else []
+    return asset, comments
 
 
 # _mtls_note explains why `mtls` is not written. Whether a service requires client
@@ -353,12 +358,12 @@ def _mtls_note(leaf, has_truststore: bool):
         return None
     hints = [reason] + (["truststore present"] if has_truststore else [])
     verdict = "possible" if candidate else "unlikely as client"
-    return (f"mtls: not set, cannot be inferred from Secrets ({'; '.join(hints)}): {verdict}; "
+    return (f"not set, cannot be inferred from Secrets ({'; '.join(hints)}): {verdict}; "
             "set it from the application config, e.g. client-auth=need")
 
 
 # render_inventory writes the discovered assets as YAML. PyYAML cannot emit comments,
-# so each asset is dumped on its own and preceded by its notes as comments.
+# so each asset is dumped on its own and preceded by its comment lines.
 def render_inventory(cluster_name: str, context: str, discovered: list[tuple[dict, list[str]]],
                      header: list[str]) -> str:
     lines = [f"# {h}" for h in header]
@@ -367,9 +372,9 @@ def render_inventory(cluster_name: str, context: str, discovered: list[tuple[dic
         lines += ["clusters:", f"  - name: {json.dumps(cluster_name)}",
                   f"    context: {json.dumps(context)}", ""]
     lines.append("assets:" if discovered else "assets: []")
-    for asset, notes in discovered:
+    for asset, comments in discovered:
         lines.append("")
-        lines += [f"  # {note}" for note in notes]
-        dumped = yaml.safe_dump([asset], sort_keys=False, default_flow_style=False)
+        lines += [f"  # {comment}" for comment in comments]
+        dumped = yaml.safe_dump([asset], sort_keys=False, default_flow_style=False, width=1000)
         lines += ["  " + line if line else line for line in dumped.rstrip("\n").split("\n")]
     return "\n".join(lines) + "\n"

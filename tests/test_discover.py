@@ -97,7 +97,7 @@ def discover_all(cluster_secrets, namespaces=("web-prod", "api-prod", "other")):
     used, out = set(), []
     for ns in namespaces:
         out += discover.discover_namespace(ns, cluster_secrets[ns], "kind", used)
-    return {asset["id"]: (asset, notes) for asset, notes in out}
+    return {asset["id"]: (asset, asset.get("notes", {})) for asset, _comments in out}
 
 
 # --- discover_namespace -------------------------------------------------------------
@@ -105,8 +105,8 @@ def discover_all(cluster_secrets, namespaces=("web-prod", "api-prod", "other")):
 def test_tls_secret_becomes_pem_asset(cluster_secrets):
     asset, notes = discover_all(cluster_secrets)["web-tls"]
     assert asset == {"id": "web-tls", "cluster": "kind", "namespace": "web-prod", "cn": "www.example.com",
-                     "certType": "pem", "keystore": {"secret": {"name": "web-tls", "key": "tls.crt"}}}
-    assert any("cert-manager" in n and "'web'" in n for n in notes)
+                     "certType": "pem", "keystore": {"secret": {"name": "web-tls", "key": "tls.crt"}},
+                     "notes": {"managed_by": "cert-manager (Certificate 'web')"}}
 
 
 def test_jks_with_passwords_found_and_verified(cluster_secrets):
@@ -119,7 +119,7 @@ def test_jks_with_passwords_found_and_verified(cluster_secrets):
     assert asset["truststore"]["passwordRef"] == {"name": "api-tls", "key": "truststorePassword"}
     # keystore + truststore is not proof of mTLS: the field is not written, only a hint
     assert "mtls" not in asset
-    note = next(n for n in notes if n.startswith("mtls:"))
+    note = notes["mtls"]
     # make_keystore's leaf has no EKU extension: no restriction, so client use is possible
     assert "no EKU" in note and "truststore present" in note and "possible" in note
 
@@ -135,7 +135,8 @@ def test_missing_password_is_todo_never_guessed(cluster_secrets):
     orphan, orphan_notes = found["orphan-p12"]
     assert orphan["keystore"]["passwordRef"] == {"name": "TODO", "key": "TODO"}
     assert orphan["cn"] == "TODO"
-    assert any("password not found" in n for n in orphan_notes)
+    assert "password not found" in orphan_notes["keystore_password"]
+    assert "fill it in" in orphan_notes["cn"]
 
     # a password-looking key that does not open the store is not written
     wrong, _ = found["wrong-pass"]
@@ -156,27 +157,27 @@ def test_missing_password_is_todo_never_guessed(cluster_secrets):
 def test_password_secret_naming_variants(password_secret, key):
     secrets = [secret("billing-tls", {"keystore.p12": p12("b.example.com", b"Xy9-unique")}),
                secret(password_secret, {key: b"Xy9-unique"})]
-    (asset, notes), = discover.discover_namespace("ns", secrets, None, set())
+    (asset, _), = discover.discover_namespace("ns", secrets, None, set())
     assert asset["keystore"]["passwordRef"] == {"name": password_secret, "key": key}
-    assert not any("not related" in n for n in notes)
+    assert "keystore_password" not in asset.get("notes", {})
 
 
 def test_password_from_unrelated_secret_is_flagged(make_keystore):
     # two apps sharing the default password: found, but the reference is suspicious
     secrets = [secret("billing-tls", {"keystore.jks": make_keystore(leaf_cn="b.example.com")}),
                secret("orders-config", {"keystorePassword": b"changeit"})]
-    (asset, notes), = discover.discover_namespace("ns", secrets, None, set())
+    (asset, _), = discover.discover_namespace("ns", secrets, None, set())
     assert asset["keystore"]["passwordRef"] == {"name": "orders-config", "key": "keystorePassword"}
-    assert any("not related by name" in n for n in notes)
+    assert "not related by name" in asset["notes"]["keystore_password"]
 
 
 def test_related_secret_wins_over_unrelated_with_same_password(make_keystore):
     secrets = [secret("billing-tls", {"keystore.jks": make_keystore(leaf_cn="b.example.com")}),
                secret("a-unrelated", {"keystorePassword": b"changeit"}),
                secret("billing-pwd", {"value": b"changeit"})]
-    (asset, notes), = discover.discover_namespace("ns", secrets, None, set())
+    (asset, _), = discover.discover_namespace("ns", secrets, None, set())
     assert asset["keystore"]["passwordRef"] == {"name": "billing-pwd", "key": "value"}
-    assert not any("not related" in n for n in notes)
+    assert "keystore_password" not in asset.get("notes", {})
 
 
 def test_unrelated_name_with_base_in_the_middle_is_not_related():
@@ -197,7 +198,7 @@ def test_truststore_secret_attached_by_base_name(cluster_secrets):
 def test_unclaimed_truststore_becomes_its_own_asset(cluster_secrets):
     asset, notes = discover_all(cluster_secrets)["lonely-ca"]
     assert asset["keystore"]["secret"] == {"name": "lonely-ca", "key": "truststore.pem"}
-    assert notes[0].startswith("truststore only")
+    assert notes["content"].startswith("truststore only")
 
 
 def test_non_certificate_secrets_are_skipped(cluster_secrets):
@@ -237,6 +238,21 @@ def test_rendered_yaml_passes_validate_and_has_no_secret_values(cluster_secrets,
     assert code == 0, out
 
 
+def test_discovered_notes_reach_the_csv(cluster_secrets, tmp_path, capsys):
+    import csv, io
+    used, discovered = set(), []
+    for ns in ("web-prod", "api-prod"):
+        discovered += discover.discover_namespace(ns, cluster_secrets[ns], "kind", used)
+    path = tmp_path / "inv.yaml"
+    path.write_text(discover.render_inventory("kind", "kind-ctx", discovered, ["h"]))
+    code, out = run_cli(["validate", str(path), "--format", "csv"], capsys)
+    assert code == 0, out
+    rows = {r["id"]: r for r in csv.DictReader(io.StringIO(out))}
+    assert rows["web-tls"]["notes_managed_by"] == "cert-manager (Certificate 'web')"
+    assert "password not found" in rows["orphan-p12"]["notes_keystore_password"]
+    assert rows["api-tls"]["notes_mtls"].startswith("not set")
+
+
 # --- CLI ------------------------------------------------------------------------------
 
 @pytest.fixture
@@ -262,7 +278,7 @@ def test_cli_discover_to_stdout(fake_discover, capsys):
     inv = yaml.safe_load(out)
     assert inv["clusters"] == [{"name": "kind-test", "context": "kind-test"}]
     assert {a["id"] for a in inv["assets"]} >= {"web-tls", "api-tls", "billing-tls", "myapp-tls"}
-    assert "# keystore: password not found automatically" in out
+    assert "keystore_password: 'password not found automatically" in out
     assert err.startswith("discovered ") and "with TODO values" in err
 
 
@@ -337,9 +353,9 @@ def test_jks_without_pyjks_says_so(monkeypatch, make_keystore):
     data = make_keystore(leaf_cn="api.example.com")
     monkeypatch.setitem(sys.modules, "jks", None)
     s = secret("api-tls", {"keystore.jks": data, "keystorePassword": b"changeit"})
-    (asset, notes), = discover.discover_namespace("ns", [s], None, set())
+    (asset, _), = discover.discover_namespace("ns", [s], None, set())
     assert asset["keystore"]["passwordRef"] == {"name": "TODO", "key": "TODO"}
-    assert any("pyjks is not installed" in n for n in notes)
+    assert "pyjks is not installed" in asset["notes"]["keystore_password"]
 
 
 @pytest.mark.parametrize("eku, has_truststore, expected", [
@@ -355,7 +371,7 @@ def test_mtls_note(eku, has_truststore, expected):
     if expected is None:
         assert note is None
     else:
-        assert note.startswith("mtls: not set") and expected in note
+        assert note.startswith("not set") and expected in note
 
 
 def test_system_namespace_filter():

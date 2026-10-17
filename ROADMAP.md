@@ -368,6 +368,7 @@ Implemented in `discover.py` + `cmd_discover`; tests in `tests/test_discover.py`
 - Keystore/truststore role from the key name (`trust` → truststore); pairing in the same Secret or by base name across Secrets
 - Password discovery verified by opening the store (never writes an unverified passwordRef), `TODO` placeholders with comments otherwise
 - Schema change: `truststore.passwordRef` is now optional (a PEM CA bundle has no password); validated if present
+- Findings are written to the asset's `notes` field (key → text, schema-validated, `notes_<key>` columns in csv) instead of YAML comments, so they survive in table/csv output and spreadsheets
 - Not implemented: grouping by Deployment/StatefulSet volume mounts; merging into an existing inventory (discover writes a new file)
 
 ### Discovery logic
