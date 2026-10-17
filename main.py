@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import yaml
-from cert_analysis import cert_format, cert_metadata_extract, eku_inspect, csr_generate, expiry_warning
+from cert_analysis import cert_format, cert_metadata_extract, mtls_candidate, csr_generate, expiry_warning
 from output import FORMATS, render_rows
 # live.py / cluster.py (and the kubernetes client they need) are deliberately NOT imported
 # here: they are imported by make_live_clients() only when --live is used, so offline
@@ -288,8 +288,9 @@ def cmd_analyse(args):
             print(f"  WARNING: {warning}")
         print("----")
 
-    is_mtls = eku_inspect(metadata)
-    print(f"mTLS candidate: {is_mtls}")
+    # a hint from the leaf EKU only: whether mTLS is enforced is application config
+    is_mtls, reason = mtls_candidate(metadata)
+    print(f"mTLS candidate: {is_mtls} ({reason})")
     exit_on_expiry(args, expiring)
 
 

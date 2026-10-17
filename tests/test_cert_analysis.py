@@ -13,6 +13,7 @@ from cert_analysis import (
     cert_metadata_extract,
     csr_generate,
     eku_inspect,
+    mtls_candidate,
     expiry_warning,
 )
 from conftest import TEST_CERTS, cert_pem, make_cert
@@ -174,12 +175,38 @@ def test_expiry_warning_expired_and_not_yet_valid(fixed_cert):
 
 # --- mTLS heuristic -----------------------------------------------------------
 
-def test_eku_inspect():
-    assert eku_inspect({"eku": ["serverAuth", "clientAuth"]}) is True
-    assert eku_inspect([{"eku": ["serverAuth"]}, {"eku": ["clientAuth"]}]) is True
-    assert eku_inspect({"eku": ["serverAuth"]}) is False
-    assert eku_inspect([]) is False
-    assert eku_inspect(None) is False
+@pytest.mark.parametrize("metadata, expected, reason", [
+    ({"eku": ["serverAuth", "clientAuth"]}, True, "clientAuth in EKU"),
+    ({"eku": ["clientAuth"]}, True, "clientAuth in EKU"),            # pure client cert
+    ({"eku": []}, True, "no EKU extension"),                         # no restriction (RFC 5280)
+    ({"eku": ["serverAuth"]}, False, "EKU without clientAuth"),
+    # only the leaf counts: a CA with clientAuth further down the chain does not
+    ([{"eku": ["serverAuth"]}, {"eku": ["clientAuth"], "is_ca": True}], False, "EKU without clientAuth"),
+    ({"eku": [], "is_ca": True}, False, "is a CA"),
+    ([{"eku": [], "entry_type": "TrustedCertEntry"}], False, "no leaf certificate"),
+    ([], False, "no leaf certificate"),
+    (None, False, "no leaf certificate"),
+])
+def test_mtls_candidate(metadata, expected, reason):
+    candidate, why = mtls_candidate(metadata)
+    assert candidate is expected
+    assert reason in why
+    assert eku_inspect(metadata) is expected
+
+
+def test_is_ca_field(full_san_cert):
+    assert _extract_cert_metadata(full_san_cert)["is_ca"] is False
+    from cryptography.hazmat.primitives import hashes
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "CA")])
+    now = datetime.now(timezone.utc)
+    ca = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+          .serial_number(1).not_valid_before(now).not_valid_after(now + timedelta(days=1))
+          .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+          .sign(key, hashes.SHA256()))
+    meta = _extract_cert_metadata(ca)
+    assert meta["is_ca"] is True
+    assert mtls_candidate(meta) == (False, "the certificate is a CA")
 
 
 # --- CSR generation -----------------------------------------------------------

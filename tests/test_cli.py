@@ -128,7 +128,7 @@ def test_analyse_output_is_human_readable(capsys):
     assert code == 0
     assert "  san: DNS:test.example.com, DNS:*.example.com" in out
     assert "  eku: serverAuth, clientAuth" in out
-    assert "mTLS candidate: True" in out
+    assert "mTLS candidate: True (clientAuth in EKU)" in out
     assert "<DNSName" not in out and "ObjectIdentifier" not in out
 
 

@@ -208,6 +208,11 @@ def _extract_cert_metadata(cert, alias: str = None, now: datetime = None) -> dic
         metadata["san"] = []
 
     try:
+        metadata["is_ca"] = cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    except ExtensionNotFound:
+        metadata["is_ca"] = False
+
+    try:
         eku_ext = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
         metadata["eku"] = [_format_oid(eku) for eku in eku_ext.value]
     except ExtensionNotFound:
@@ -313,38 +318,35 @@ def cert_metadata_extract(data: bytes, cert_type: str, optional_password: str = 
     raise ValueError(f"unsupported certificate type: {cert_type}")
 
 
-# eku_inspect inspects the TLS Certificate Extended Key Usage extension for Server Authentication and Client Authentication. If both are present the cert will most likely be mTLS.
-# Also verifies if the PrivateKey is present, if it's present this could also be mTLS (BEWARE! it's not definitive).
-# The presence of a Truststore is another mTLS indicator. In a typical mTLS setup the truststore holds the CA certificates used to verify the **peer's** certificate. If `mtls: true` is set but no truststore is defined, that could be worth a warning too.
-def eku_inspect(metadata: dict | list[dict]) -> bool:
-    if metadata is None:
-        return False
+# mtls_candidate tells whether the certificate material could be used as an mTLS client
+# certificate, judging only from the leaf certificate's Extended Key Usage. It is a hint,
+# never a proof: whether mTLS is enforced is application/proxy configuration.
+#   - no EKU extension: no usage restriction (RFC 5280), client use allowed -> candidate
+#   - EKU with clientAuth: candidate (many CAs add it by default, so not conclusive)
+#   - EKU without clientAuth: cannot be presented as a client certificate -> not a candidate
+# Only the leaf counts: CA certs further down the chain (or in a truststore) are never
+# presented by the application, so their EKU says nothing about it.
+# Returns (is_candidate, reason).
+def mtls_candidate(metadata: dict | list[dict]) -> tuple[bool, str]:
     if isinstance(metadata, dict):
-        metadata = [metadata]  # normalize to list for easier processing
-    if len(metadata) == 0:
-        return False
-    has_server_auth = False
-    has_client_auth = False
-    for cert_meta in metadata:
-        eku = cert_meta.get("eku", [])
-        if any("serverAuth" in usage for usage in eku):
-            has_server_auth = True
-        if any("clientAuth" in usage for usage in eku):
-            has_client_auth = True
-        if "alias" in cert_meta:  # JKS entries with alias are likely to be trusted certs, not private keys
-            continue
-        # if "private_key" in cert_meta:
-        #    has_private_key = True
+        metadata = [metadata]
+    leaf = next((m for m in metadata or [] if m.get("entry_type") != "TrustedCertEntry"), None)
+    if leaf is None:
+        return False, "no leaf certificate (only trusted CA entries)"
+    if leaf.get("is_ca"):
+        return False, "the certificate is a CA"
+    eku = leaf.get("eku", [])
+    logger.info("EKU of the leaf certificate: %s", ", ".join(eku) or "(none)")
+    if not eku:
+        return True, "no EKU extension, any usage allowed"
+    if "clientAuth" in eku:
+        return True, "clientAuth in EKU"
+    return False, f"EKU without clientAuth ({', '.join(eku)})"
 
-        # Note: We cannot reliably detect private key presence from cert metadata alone
-        # unless we parse the key file separately. 
-        # For now, mTLS detection relies on EKU + Truststore presence (checked in main.py)
 
-        # Check results AFTER looping through all certs
-    is_mtls_candidate = has_server_auth and has_client_auth
-
-    logger.info("EKU inspection results: Server Auth=%s, Client Auth=%s", has_server_auth, has_client_auth)
-    return is_mtls_candidate
+# eku_inspect is the boolean form of mtls_candidate, kept for existing callers.
+def eku_inspect(metadata: dict | list[dict]) -> bool:
+    return mtls_candidate(metadata)[0]
 
 
 # _load_jks_leaf returns (leaf cert, private key or None) from the first private key entry

@@ -80,7 +80,7 @@ Running `python main.py` with no arguments prints usage help.
 ### Available now
 
 - **YAML validation** (`validate`) — parses single or multiple certificate asset definitions, validates required fields and structure based on `certType`, fails fast with human-readable errors
-- **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates
+- **Certificate analysis** (`analyse`) — detects format from raw bytes (PEM, DER, PKCS12, JKS), extracts metadata (Subject, Issuer, Serial, Validity, SANs, EKU), handles password-protected keystores, flags mTLS candidates (from the leaf certificate's EKU only: `clientAuth` or no EKU at all; a hint, since mTLS is enforced by application config)
 - **Expiration warnings** — every analysed certificate reports `validity_status`, `days_remaining` and a readable `expiry` label; a `WARNING` line is printed for expired, not-yet-valid, or soon-to-expire certificates (`--warn-days`, default 30). By default warnings do not change the exit code; `--fail-on-expiry` (on `analyse`, and on `validate`/`search` with `--live`) exits 1 when any certificate triggers one, with the reason on stderr so CSV output stays clean
 - **Multi-cluster inventory** — single YAML file covering assets across multiple clusters, each referencing a kubeconfig context
 - **CSR generation** (`csr`) — generates a Certificate Signing Request from an existing certificate (PEM, DER, PKCS12, JKS), preserving subject (CN, OU, O, etc.), SANs, EKU, and other extensions. By default it generates a new key pair matching the original key type and size (written with mode 0600). Options:

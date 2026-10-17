@@ -346,7 +346,7 @@ def test_jks_without_pyjks_says_so(monkeypatch, make_keystore):
     ([], False, None),
     ([], True, "possible"),                       # no EKU extension = any usage
     (["serverAuth"], False, None),
-    (["serverAuth"], True, "unlikely as client (EKU without clientAuth)"),
+    (["serverAuth"], True, "EKU without clientAuth (serverAuth); truststore present): unlikely as client"),
     (["serverAuth", "clientAuth"], False, "possible"),
     (["serverAuth", "clientAuth"], True, "possible"),
 ])

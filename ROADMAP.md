@@ -10,7 +10,7 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 
 - `cert_format(data, path, optional_password)` — probes raw bytes: PEM → DER → JKS/JCEKS (magic number) → PKCS12
 - `cert_metadata_extract(data, cert_type, optional_password)` — returns subject, issuer, serial, validity, SANs, EKU
-- `eku_inspect(metadata)` — flags mTLS candidates (serverAuth + clientAuth)
+- `mtls_candidate(metadata)` → `(bool, reason)` — mTLS client hint from the **leaf** EKU only: `clientAuth`, or no EKU extension (RFC 5280: any usage), makes it a candidate; an EKU without `clientAuth`, a CA, or no leaf (truststore) does not. `eku_inspect()` is its boolean wrapper. Metadata now carries `is_ca` (Basic Constraints)
 - `_extract_cert_metadata(cert, alias, now)` — shared helper for consistent extraction; SANs rendered openssl-style (`DNS:`, `IP:`, `email:`, `URI:`, ...; `otherName:UPN:user@example.com`, hex for non-text otherName values), EKUs by short name (dotted OID when unknown), plus expiry fields
 - `expiry_warning(metadata, warn_days)` — one-line warning for expired, not-yet-valid, or soon-to-expire certs
 - `pyjks` is imported lazily: PEM/DER/PKCS12 analysis works without it
