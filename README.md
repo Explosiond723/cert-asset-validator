@@ -101,12 +101,17 @@ Running `python main.py` with no arguments prints usage help.
   - `--live --id ASSET` takes the certificate from the inventory asset: keystore and password come from its Secrets; for `tls.crt` assets `--reuse-key` reads `tls.key` from the same Secret. Outputs default to `<asset-id>.csr` / `<asset-id>-key.pem`
 - **Cluster connectivity** — connects to Kubernetes/OpenShift clusters via kubeconfig or in-cluster ServiceAccount, retrieves secrets, and discovers TLS-related secrets in a namespace. Works with any provider (OpenShift, GKE, EKS, AKS).
 - **Search & query** (`search`) — filter assets by CN (substring match), secret name, namespace, or cluster; combine multiple filters with AND logic
-- **Live mode** (`validate --live`, `search --live`) — read-only: fetches each asset's keystore/truststore and password from its Secrets, analyses the real certificates, and cross-checks them against the YAML (declared `certType` vs actual format, `cn` vs real CN/SANs, `mtls` without truststore, expiry). Each asset is checked independently: an unreachable cluster or a missing Secret is reported for that asset and the run continues; the exit code is 1 if any asset had errors. With `--live`, `search --cn` also matches the real CN and SANs.
+- **Live mode** (`validate --live`, `search --live`) — read-only: fetches each asset's keystore/truststore and password from its Secrets, analyses the real certificates, and cross-checks them against the YAML (declared `certType` vs actual format, `cn` vs real CN/SANs, `mtls` without truststore, expiry). It also reports:
+  - **private key**: where the certificate's key is (`in the keystore` for JKS/PKCS12, `in the same file` for a PEM bundle, `in Secret key 'tls.key'` when another key of the same Secret holds it — found by name, its content is never read). This is a fact, not an mTLS verdict: every TLS server needs its key. Only `mtls: true` with no key found is a warning
+  - **chain verified**: the leaf is checked **by signature** against the CA certificates in the keystore and in the asset's optional `chain` Secret (the `openssl verify -CAfile cacerts.pem tls.crt` of the renewal procedure, first hop). A CA with the right name but the wrong key fails the check Each asset is checked independently: an unreachable cluster or a missing Secret is reported for that asset and the run continues; the exit code is 1 if any asset had errors. With `--live`, `search --cn` also matches the real CN and SANs.
 - **Auto-discovery** (`discover`) — scans the Secrets of one or more namespaces (read-only) and writes a YAML inventory that passes `validate`:
   - finds `kubernetes.io/tls` Secrets and Opaque keys holding PEM, DER, PKCS12 or JKS material (detected by content, not only by key name); skips service-account tokens, registry credentials, Helm releases, private keys
   - pairs keystores with truststores in the same Secret, or in a Secret with the same base name (`myapp-tls` + `myapp-truststore`)
+  - CA chain keys next to a certificate (`cacerts.pem`, `ca.crt` — also in `kubernetes.io/tls` Secrets written by cert-manager — `chain.pem`, `ca-bundle.crt`, `intermediate.pem`, ...) become the asset's `chain` instead of a keystore of their own; `fullchain.pem` holds the leaf too and stays a keystore. A Secret holding only CA material is a truststore (CA bundle). Add your own names with `--chain-key KEY`
+  - **backup copies** of other Secrets (`api-tls-bck`, `api-tls.backup`, `api-tls-bck-20240101`; words `bck`, `bkp`, `backup`, `bak`, `old`, more with `--backup-suffix WORD`) are left out and counted in the summary: they hold the previous certificate on purpose. A name only counts as a backup when the Secret it copies exists in the same namespace (`old-tls` alone is not one). `--include-backups` inventories them with a `notes.backup`
+  - `notes.private_key` says where the private key is (or that none was found), as a fact: it does not imply mTLS
   - never sets `mtls`: whether a service requires client certificates is application or proxy configuration (`client-auth=need`, `ssl_verify_client`, Ingress `auth-tls-*`), and keystore + truststore is also the normal setup for outbound TLS. `notes.mtls` reports the hints that are available (truststore present, leaf EKU)
-  - findings for people go in the asset's `notes` field (`mtls`, `keystore_password`, `truststore_password`, `cn`, `managed_by`, `content`), so they reach table/csv output; YAML comments only carry the subject and expiry
+  - findings for people go in the asset's `notes` field (`mtls`, `private_key`, `keystore_password`, `truststore_password`, `chain`, `cn`, `backup`, `managed_by`, `content`), so they reach table/csv output; YAML comments only carry the subject and expiry
   - looks for the password, in this order: password-like keys of the same Secret; any key of a Secret related by name, i.e. the base name (`billing` for `billing-tls`) as prefix or suffix plus a password-like word (`billing-pwd`, `billing.password`, `billing-tls-pw`, `billing-keystore-pass`, `billing-creds`, `pwd-billing`, ...); keys named after the app in shared password Secrets (`app-passwords: {billing: ...}`); finally password-like keys of any other Secret in the namespace, flagged with a comment because a default password shared by several apps also matches. A `passwordRef` is written **only if that password actually opens the keystore**; otherwise `TODO` with a comment
   - reads `cn` from the certificate; notes cert-manager ownership and expiry as comments
   - `-A` skips `kube-*`, `openshift*` and `default` unless `--include-system`; a namespace that cannot be listed is reported and skipped (exit 1, partial inventory still written)
@@ -115,11 +120,11 @@ Running `python main.py` with no arguments prints usage help.
     - an asset is recognised by the Secrets it points to (cluster + namespace + Secret + key of keystore or truststore), not by its id, so renamed assets are not duplicated
     - only new assets are appended, as text, at the end of the `assets` list with the same indentation: the rest of the file stays byte for byte, comments included
     - the result is re-parsed before writing (it must contain exactly the old assets plus the new ones) and written atomically; if appending is not safe (e.g. `assets` is not the last section) nothing is written
-    - the cluster must already be in the `clusters` section (matched by kubeconfig context, or `--cluster-name`); assets whose Secrets disappeared are listed, never removed
+    - the cluster must already be in the `clusters` section (matched by kubeconfig context, or `--cluster-name`); assets whose Secrets disappeared are listed, never removed (backup Secrets left out are not reported as gone)
 - **Cross-reference map** (`map`) — reads the real certificates (always connects, like `discover`) and shows three views (`--view certificates|cas|assets`, all by default; `table`/`csv` need one view):
-  - **certificates**: each asset certificate with every place it lives (same SHA-256 fingerprint), and a warning when the **same name exists as different certificates** — typically a renewal applied in one place but not in another
+  - **certificates**: each asset certificate with every place it lives (same SHA-256 fingerprint), and a warning when the **same name exists as different certificates** — typically a renewal applied in one place but not in another. A version found only in backup Secrets (same rules as `discover`, or a `notes.backup`) is the expected leftover of a renewal: it is shown as a note, not as a missing renewal
   - **cas**: every CA in the inventory with the certificates it signed, who trusts it (truststores) and whose chain carries it; issuers that appear nowhere in the inventory are listed too. Certificates are linked to their CA by key identifier (AKI/SKI), with the DN as fallback, so a renewed CA with the same name is told apart (and flagged)
-  - **assets**: per asset, whether the keystore chain contains the issuing CA, whether the truststore trusts the asset's own CA, which trusted CAs sign nothing in the inventory, and which other assets use the same certificate
+  - **assets**: per asset, whether the chain (keystore or `chain` Secret) contains the issuing CA — verified by signature —, where the private key is, whether it is a backup copy, whether the truststore trusts the asset's own CA, which trusted CAs sign nothing in the inventory, and which other assets use the same certificate
   - `--cn` limits the map to assets whose YAML cn or real CN/SANs match; exit 1 if any asset could not be read
 - **Notes** (`notes:` on an asset, optional) — free-form `key: text` pairs, written by `discover` and editable by hand (e.g. `owner: team-payments`). In `--format csv` every key becomes a `notes_<key>` column, ready for spreadsheet filtering; `table` shows a `notes` column listing the keys; `validate` (list) prints them
 - **Output formats** (`--format list|table|csv` on `validate`, `search` and `analyse`) — `list` is the default human-readable layout; `table` is an aligned view; `csv` carries every field, one row per asset or certificate, multi-value cells joined with `; `
@@ -176,14 +181,15 @@ It can also be started by hand from the Actions tab (`Run workflow`).
 `e2e/kind.sh` runs `--live` against a real API server on a local [kind](https://kind.sigs.k8s.io/) cluster (requires docker or podman, kind, kubectl):
 
 ```bash
-e2e/kind.sh up     # cluster, Secrets (PEM, JKS, PKCS12, expired, mismatched), RBAC, e2e/out/inventory.yaml
+e2e/kind.sh up     # cluster, Secrets (PEM, JKS, PKCS12, expired, mismatched, chain + -bck), RBAC, e2e/out/inventory.yaml
 e2e/kind.sh run    # scenarios with expected exit codes; log in e2e/out/run.log
 e2e/kind.sh down   # delete the cluster and e2e/out/
 ```
 
-Each scenario checks the exit code **and** the output: the messages it must print (`expect`), those it must not (`reject`), and no Python traceback, so a crash cannot pass for an expected failure. Two scenarios also look inside the results: the subject and SANs of the generated CSRs, and the `passwordRef`s written by `discover`. The harness itself is tested in `tests/test_e2e_harness.py`.
+Each scenario checks the exit code **and** the output: the messages it must print (`expect`), those it must not (`reject`), and no Python traceback, so a crash cannot pass for an expected failure. Two scenarios also look inside the results: the subject and SANs of the generated CSRs, and the `passwordRef`s, `chain` and notes written by `discover`. The harness itself is tested in `tests/test_e2e_harness.py`.
 
-It uses its own kubeconfig (`e2e/out/kubeconfig`), so `~/.kube/config` is not modified. The inventory covers OK assets, expiry warnings, YAML/cluster mismatches, a missing Secret, an RBAC denial through a limited ServiceAccount, and an unknown context.
+It uses its own kubeconfig (`e2e/out/kubeconfig`), so `~/.kube/config` is not modified. The inventory covers OK assets, expiry warnings, YAML/cluster mismatches, a missing Secret, an RBAC denial through a limited ServiceAccount, an unknown context, and the renewal-guide layout (generic Secret with `tls.crt` + `tls.key` + `cacerts.pem`, plus its `-bck` copy holding the previous certificate).
+
 ## Configuration model
 
 The YAML configuration describes **how certificate material is stored**, not the material itself.
@@ -223,6 +229,18 @@ assets:
         key: truststorePassword
 
     mtls: true
+
+  # The layout of a generic Secret with the CA chain in its own key (tls.crt + tls.key +
+  # cacerts.pem). `chain` is optional: CA certificates used to verify the leaf, no password.
+  - id: portal
+    cluster: prod-ocp
+    namespace: portal-prod
+    cn: portal.example.com
+    certType: pem
+    keystore:
+      secret: {name: portal-tls, key: tls.crt}
+    chain:
+      secret: {name: portal-tls, key: cacerts.pem}
 ```
 
 See `example-cfg.yaml` for additional examples.

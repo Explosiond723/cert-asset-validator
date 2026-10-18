@@ -256,3 +256,81 @@ def test_cli_map_table_needs_a_view(map_cluster):
     with pytest.raises(SystemExit) as exc:
         main.main(["map", map_cluster["path"], "--format", "table"])
     assert exc.value.code == 2
+
+
+# --- chain Secret, private key, backups -------------------------------------------------
+
+@pytest.fixture(scope="module")
+def guide_report(pki):
+    # The layout of the renewal guide: generic Secret tls.crt + tls.key + cacerts.pem, and the
+    # <secret>-bck copy taken before the renewal (it still holds the old certificate).
+    api = FakeCoreV1Api({
+        ("portal", "portal-tls"): {"tls.crt": pem(pki["www_v2"]), "tls.key": b"k",
+                                   "cacerts.pem": pem(pki["corp_new"][0])},
+        ("portal", "portal-tls-bck"): {"tls.crt": pem(pki["www_v1"]), "tls.key": b"k",
+                                       "cacerts.pem": pem(pki["corp_old"][0])},
+        # chain Secret holding the wrong CA (same DN, other key)
+        ("portal", "wrong-tls"): {"tls.crt": pem(pki["api"]), "cacerts.pem": pem(pki["corp_old"][0])},
+    })
+
+    def asset(asset_id, secret, cn):
+        a = tls_asset(asset_id, "portal", secret, cn)
+        a["chain"] = {"secret": {"name": secret, "key": "cacerts.pem"}}
+        return a
+
+    assets = [asset("portal", "portal-tls", "www.example.com"),
+              asset("portal-bck", "portal-tls-bck", "www.example.com"),
+              asset("wrong", "wrong-tls", "api.example.com")]
+    clients = FakeClients({"prod": "prod-ctx"}, {"prod-ctx": api})
+    pairs = [(a, live.inspect_asset(a, clients, 30)) for a in assets]
+    return certmap.build_map(pairs, 30)
+
+
+def test_chain_secret_certs_are_mapped(guide_report, pki):
+    portal = by(guide_report["assets"], "id", "portal")
+    assert portal["chain_complete"] is True
+    assert portal["chain_source"] == "Secret portal-tls (cacerts.pem)"
+    assert portal["private_key"] == "in Secret key 'tls.key'"
+    ca = by(guide_report["cas"], "fingerprint", pki["corp_new"][0].fingerprint(hashes.SHA256()).hex())
+    assert ca["in_chain_of"] == ["portal"] and ca["signs"] == ["portal", "wrong"]
+    # verified by signature: a CA with the issuer's DN but another key does not complete the chain
+    assert by(guide_report["assets"], "id", "wrong")["chain_complete"] is False
+
+
+def test_backup_is_not_a_missing_renewal(guide_report, pki):
+    current = by(guide_report["certificates"], "fingerprint", pki["www_v2"].fingerprint(hashes.SHA256()).hex())
+    old = by(guide_report["certificates"], "fingerprint", pki["www_v1"].fingerprint(hashes.SHA256()).hex())
+    assert current["other_versions"] == [] and current["backup_only"] is False
+    assert old["backup_only"] is True and old["other_versions"] == [current["fingerprint"]]
+    assert by(guide_report["assets"], "id", "portal-bck")["backup_of"] == "portal-tls"
+    assert by(guide_report["assets"], "id", "portal")["backup_of"] is None
+
+
+def test_print_map_marks_backups(guide_report, capsys):
+    certmap.print_map(guide_report, ["certificates", "assets"])
+    out = capsys.readouterr().out
+    assert "[asset portal-bck, keystore, backup]" in out
+    assert "NOTE: found only in backups; current version(s):" in out
+    assert "same name, different certificate(s) elsewhere" not in out
+    assert "backup of: portal-tls" in out
+    assert "chain complete: yes (from Secret portal-tls (cacerts.pem))" in out
+    assert "private key: in Secret key 'tls.key'" in out
+
+
+def test_backup_from_note_and_custom_word(pki):
+    api = FakeCoreV1Api({("p", "a-tls"): {"tls.crt": pem(pki["www_v2"])},
+                         ("p", "a-tls-prev"): {"tls.crt": pem(pki["www_v1"])},
+                         ("p", "copy"): {"tls.crt": pem(pki["www_v1"])}})
+    noted = tls_asset("copy", "p", "copy", "www.example.com")
+    noted["notes"] = {"backup": "backup copy of Secret 'a-tls'"}
+    assets = [tls_asset("a", "p", "a-tls", "www.example.com"), tls_asset("prev", "p", "a-tls-prev", "www.example.com"),
+              noted]
+    clients = FakeClients({"prod": "prod-ctx"}, {"prod-ctx": api})
+    pairs = [(a, live.inspect_asset(a, clients, 30)) for a in assets]
+    assert by(certmap.build_map(pairs, 30)["assets"], "id", "copy")["backup_of"] == "a-tls"
+    # "prev" is not a default backup word: the old certificate is a version missing a renewal
+    assert by(certmap.build_map(pairs, 30)["assets"], "id", "prev")["backup_of"] is None
+    report = certmap.build_map(pairs, 30, certmap.BACKUP_WORDS + ("prev",))
+    assert by(report["assets"], "id", "prev")["backup_of"] == "a-tls"
+    assert by(report["certificates"], "fingerprint", pki["www_v2"].fingerprint(hashes.SHA256()).hex())[
+        "other_versions"] == []

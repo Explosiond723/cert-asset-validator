@@ -412,6 +412,15 @@ python main.py discover -n energia-prod --output assets.yaml [--force]
 
 ---
 
+## Chain Secret, backups, private key — DONE
+
+From the renewal procedure the tool was born for (corporate CA, generic Secret with `tls.crt`, `tls.key`, `cacerts.pem`, `<secret>-bck` copies taken before renewing), generalised as configurable defaults:
+
+- Optional `chain` field on assets (CA certificates next to the leaf). `--live` verifies the leaf by signature against the keystore chain and the `chain` Secret (`cert_analysis.verify_issued_by`, first hop only: the full path to a root is not built)
+- `discover`: chain keys become `chain` (`--chain-key` for local names), backup Secrets are left out unless `--include-backups` (`--backup-suffix` for local words), `notes.private_key`
+- `map`: chain Secret certificates in the CA view, signature-based `chain_complete`, `private_key` / `chain_source` / `backup_of` columns, backup-only versions are not reported as a missing renewal
+- Private key presence is a fact, never an mTLS verdict: a TLS-only server keeps its key too
+
 ## Incremental improvements (can be done alongside any step)
 
 These are smaller enhancements to the existing `cert_analysis.py` that add value at any point:

@@ -369,3 +369,80 @@ def test_context_and_kubeconfig_require_live(capsys):
         with pytest.raises(SystemExit) as exc:
             main.main(["validate", EXAMPLE_CFG, *flag])
         assert exc.value.code == 2
+
+
+# --- chain, private key ---------------------------------------------------------
+
+def _ca_and_leaf(cn="www.example.com"):
+    from test_map import make_ca, make_leaf
+    ca = make_ca("Corp CA")
+    return ca, make_leaf(cn, ca)
+
+
+def _pem(*certs):
+    from test_map import pem
+    return pem(*certs)
+
+
+def test_chain_secret_is_verified_by_signature():
+    ca, leaf = _ca_and_leaf()
+    other_ca, _ = _ca_and_leaf()
+    asset = pem_asset(chain={"secret": {"name": "web-tls", "key": "cacerts.pem"}})
+    api = FakeCoreV1Api({("web-prod", "web-tls"): {"tls.crt": _pem(leaf), "tls.key": b"never read",
+                                                   "cacerts.pem": _pem(ca[0])}})
+    result = live.inspect_asset(asset, FakeClients(CONTEXTS, {"prod-ctx": api}), 30)
+    assert result["errors"] == [] and result["warnings"] == []
+    assert result["chain"]["format"] == "PEM" and len(result["chain"]["certs"]) == 1
+    assert result["chain_verified"] is True
+    assert result["private_key"] == "in Secret key 'tls.key'"
+
+    # a chain holding a CA with the same name but another key: not the issuer
+    api.secrets[("web-prod", "web-tls")]["cacerts.pem"] = _pem(other_ca[0])
+    result = live.inspect_asset(asset, FakeClients(CONTEXTS, {"prod-ctx": api}), 30)
+    assert result["chain_verified"] is False
+    assert any("not signed by any CA in its chain Secret 'web-tls/cacerts.pem'" in w for w in result["warnings"])
+
+
+def test_chain_in_the_keystore_and_no_chain_material():
+    ca, leaf = _ca_and_leaf()
+    api = FakeCoreV1Api({("web-prod", "web-tls"): {"tls.crt": _pem(leaf, ca[0])}})
+    result = live.inspect_asset(pem_asset(), FakeClients(CONTEXTS, {"prod-ctx": api}), 30)
+    assert result["chain_verified"] is True
+    assert result["private_key"] is None
+
+    api = FakeCoreV1Api({("web-prod", "web-tls"): {"tls.crt": _pem(leaf)}})
+    result = live.inspect_asset(pem_asset(), FakeClients(CONTEXTS, {"prod-ctx": api}), 30)
+    assert result["chain_verified"] is None  # nothing to check against
+    assert result["warnings"] == []
+
+
+def test_private_key_in_jks_and_mtls_without_key(make_keystore):
+    api = FakeCoreV1Api({
+        ("api-prod", "api-tls"): {"keystore.jks": make_keystore(leaf_cn="api.example.com"),
+                                  "truststore.jks": make_keystore(password="trustpass"),
+                                  "truststorePassword": b"trustpass"},
+        ("api-prod", "api-pass"): {"keystorePassword": b"changeit"},
+    })
+    result = live.inspect_asset(jks_asset(), FakeClients(CONTEXTS, {"prod-ctx": api}), 30)
+    assert result["private_key"] == "in the keystore"
+    assert not any("no private key" in w for w in result["warnings"])
+
+    # mtls: true with a certificate only: the endpoint cannot present it
+    leaf_only = FakeCoreV1Api({("web-prod", "web-tls"): {"tls.crt": www_pem()},
+                               ("web-prod", "trust"): {"ca.pem": www_pem()}})
+    asset = pem_asset(mtls=True, truststore={"secret": {"name": "trust", "key": "ca.pem"}})
+    result = live.inspect_asset(asset, FakeClients(CONTEXTS, {"prod-ctx": leaf_only}), 30)
+    assert any("mtls: true but no private key" in w for w in result["warnings"])
+
+
+def test_print_inspection_shows_chain_and_key(capsys):
+    ca, leaf = _ca_and_leaf()
+    asset = pem_asset(chain={"secret": {"name": "web-tls", "key": "cacerts.pem"}})
+    api = FakeCoreV1Api({("web-prod", "web-tls"): {"tls.crt": _pem(leaf), "tls.key": b"PRIVATE",
+                                                   "cacerts.pem": _pem(ca[0])}})
+    live.print_inspection(live.inspect_asset(asset, FakeClients(CONTEXTS, {"prod-ctx": api}), 30))
+    out = capsys.readouterr().out
+    assert "chain: web-tls/cacerts.pem  [PEM, 1 cert(s)]" in out
+    assert "private key: in Secret key 'tls.key'" in out
+    assert "chain verified: yes" in out
+    assert "PRIVATE" not in out

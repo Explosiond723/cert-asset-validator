@@ -2,10 +2,12 @@ import base64
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 
 import yaml
 
-from cert_analysis import JCEKS_MAGIC, JKS_MAGIC, _load_jks, cert_format, cert_metadata_extract, mtls_candidate
+from cert_analysis import (JCEKS_MAGIC, JKS_MAGIC, _load_jks, cert_format, cert_metadata_extract,
+                           mtls_candidate, private_key_location)
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +26,19 @@ SKIP_SECRET_TYPES = {
 # a key is only kept if cert_format() recognises it.
 CERT_KEY_SUFFIXES = (".pem", ".crt", ".cer", ".der", ".p12", ".pfx", ".jks", ".jceks")
 CERT_KEY_WORDS = ("keystore", "truststore", "cert")
-# Never treated as certificates even if they parse (private keys, CA bundle of a tls Secret).
-NOT_CERT_KEYS = ("tls.key", "ca.crt")
+# Never treated as certificates even if they parse.
+NOT_CERT_KEYS = ("tls.key",)
+
+# PEM/DER keys that hold the CA chain of the certificate next to it (cacerts.pem,
+# ca.crt of cert-manager, chain.pem of certbot, ca-bundle.crt, ...): written as the asset's
+# `chain`, not as a keystore of its own. fullchain.pem holds the leaf too: it stays a keystore.
+CHAIN_KEY_STEMS = ("ca", "cacert", "cacerts", "chain", "ca-chain", "ca-bundle", "cabundle", "ca_bundle",
+                   "intermediate", "intermediates")
+
+# Words that mark a Secret as a backup copy of another one: api-tls-bck, api-tls.backup,
+# api-tls-bck-20240101. A name only counts as a backup when the Secret it copies exists in
+# the same namespace (old-tls alone is not a backup of anything).
+BACKUP_WORDS = ("bck", "bkp", "backup", "bak", "old")
 
 # Substrings that make a Secret key look like a password (keystorePassword, storepass,
 # KEYSTORE_PWD, ssl-passphrase, ...). Matching is generous on purpose: a candidate is only
@@ -98,7 +111,39 @@ def _related_by_name(base: str, other_name: str) -> bool:
 
 
 def _is_truststore_key(key: str) -> bool:
-    return "trust" in key.lower()
+    lower = key.lower()
+    # `cacerts` is also the default Java truststore (a JKS without extension)
+    return "trust" in lower or lower.rsplit(".", 1)[0] == "cacerts"
+
+
+def _is_chain_key(key: str, extra_names=()) -> bool:
+    lower = key.lower()
+    if lower in {n.lower() for n in extra_names}:
+        return True
+    return lower.rsplit(".", 1)[0] in CHAIN_KEY_STEMS
+
+
+# backup_of returns the Secret that `name` is a backup copy of, or None. `names` are the
+# Secret names in the same namespace; `words` the backup markers (BACKUP_WORDS by default).
+def backup_of(name: str, names, words=BACKUP_WORDS) -> str | None:
+    words = {w.lower() for w in words}
+    for match in re.finditer(r"[-.]([^-.]+)", name):
+        if match.group(1).lower() in words:
+            candidate = name[: match.start()]
+            if candidate in names and candidate != name:
+                return candidate
+    return None
+
+
+# DiscoverOptions holds the knobs of discover that adapt it to local conventions.
+# skipped_backups is filled in by discover_namespace: (namespace, secret, original) of the
+# backup Secrets left out of the inventory.
+@dataclass
+class DiscoverOptions:
+    include_backups: bool = False
+    backup_words: tuple = BACKUP_WORDS
+    chain_keys: tuple = ()
+    skipped_backups: list = field(default_factory=list)
 
 
 def _looks_like_cert_key(key: str, data: bytes) -> bool:
@@ -112,16 +157,16 @@ def _looks_like_cert_key(key: str, data: bytes) -> bool:
 
 
 # _cert_stores returns the certificate stores of one Secret as dicts
-# {key, data, format, role} (role: "keystore" or "truststore").
-def _cert_stores(secret) -> list[dict]:
+# {key, data, format, role} (role: "keystore", "truststore" or "chain").
+def _cert_stores(secret, chain_keys=()) -> list[dict]:
     data = secret.data or {}
     stores = []
     if secret.type == "kubernetes.io/tls":
-        if "tls.crt" in data:
-            raw = _decode(data["tls.crt"])
-            fmt = cert_format(raw, "tls.crt")
+        for key, role in (("tls.crt", "keystore"), ("ca.crt", "chain")):
+            raw = _decode(data[key]) if data.get(key) else b""
+            fmt = cert_format(raw, key) if raw else None
             if fmt:
-                stores.append({"key": "tls.crt", "data": raw, "format": fmt, "role": "keystore"})
+                stores.append({"key": key, "data": raw, "format": fmt, "role": role})
         return stores
 
     for key in sorted(data):
@@ -131,8 +176,18 @@ def _cert_stores(secret) -> list[dict]:
         fmt = cert_format(raw, key)
         if fmt is None:
             continue
-        role = "truststore" if _is_truststore_key(key) else "keystore"
+        if fmt in ("PEM", "DER") and _is_chain_key(key, chain_keys):
+            role = "chain"
+        elif _is_truststore_key(key):
+            role = "truststore"
+        else:
+            role = "keystore"
         stores.append({"key": key, "data": raw, "format": fmt, "role": role})
+    # CA material alone (no certificate of its own next to it) is a CA bundle: a truststore
+    if not any(st["role"] == "keystore" for st in stores):
+        for st in stores:
+            if st["role"] == "chain":
+                st["role"] = "truststore"
     return stores
 
 
@@ -225,6 +280,12 @@ def _open_store(secret, store: dict, by_name: dict):
     return None, None, "password not found automatically: fill in passwordRef"
 
 
+def _password_value(ref, by_name: dict):
+    if not ref:
+        return None
+    return _decode(by_name[ref["name"]].data[ref["key"]]).decode("utf-8").rstrip("\r\n")
+
+
 def _leaf(metas: list[dict]):
     for meta in metas or []:
         if meta.get("entry_type") != "TrustedCertEntry":
@@ -258,15 +319,28 @@ def _store_ref(secret_name: str, store: dict, password_ref) -> dict:
 # password not found, ...) go in the asset's `notes` field so they survive in table/csv
 # output; comments only carry volatile information (subject, expiry).
 # Never includes secret values.
-def discover_namespace(namespace: str, secrets: list, cluster_name: str, used_ids: set) -> list[tuple[dict, list[str]]]:
+# Backup copies of other Secrets (backup_of) are left out unless options.include_backups.
+def discover_namespace(namespace: str, secrets: list, cluster_name: str, used_ids: set,
+                       options: DiscoverOptions | None = None) -> list[tuple[dict, list[str]]]:
+    options = options or DiscoverOptions()
     by_name = {s.metadata.name: s for s in secrets}
+    backups = {}
+    for name in by_name:
+        original = backup_of(name, by_name, options.backup_words)
+        if original:
+            backups[name] = original
     found = []  # (secret, stores)
     for secret in sorted(secrets, key=lambda s: s.metadata.name):
         if secret.type in SKIP_SECRET_TYPES:
             continue
-        stores = _cert_stores(secret)
-        if stores:
-            found.append((secret, stores))
+        stores = _cert_stores(secret, options.chain_keys)
+        if not stores:
+            continue
+        name = secret.metadata.name
+        if name in backups and not options.include_backups:
+            options.skipped_backups.append((namespace, name, backups[name]))
+            continue
+        found.append((secret, stores))
 
     # Standalone truststore Secrets (only truststore keys) are attached to the asset whose
     # Secret has the same base name (myapp-tls + myapp-truststore) when there is one.
@@ -281,6 +355,7 @@ def discover_namespace(namespace: str, secrets: list, cluster_name: str, used_id
         name = secret.metadata.name
         keystores = [st for st in stores if st["role"] == "keystore"]
         truststores = [st for st in stores if st["role"] == "truststore"]
+        chains = [st for st in stores if st["role"] == "chain"]
         if not keystores:
             continue  # handled below if it was not attached
 
@@ -290,8 +365,12 @@ def discover_namespace(namespace: str, secrets: list, cluster_name: str, used_id
             attached.add(ts_secret.metadata.name)
 
         for ks in keystores:
-            results.append(_build_asset(namespace, cluster_name, secret, ks, truststores[:1],
-                                        len(keystores) > 1, by_name, used_ids))
+            asset, comments = _build_asset(namespace, cluster_name, secret, ks, truststores[:1],
+                                           len(keystores) > 1, by_name, used_ids)
+            if chains:
+                _add_chain(asset, name, chains)
+            _note_backup(asset, name, backups)
+            results.append((asset, comments))
 
     # truststore-only Secrets nobody claimed become assets of their own
     for secret, stores in found:
@@ -299,9 +378,34 @@ def discover_namespace(namespace: str, secrets: list, cluster_name: str, used_id
         if name in attached or any(st["role"] == "keystore" for st in stores):
             continue
         asset, comments = _build_asset(namespace, cluster_name, secret, stores[0], [], False, by_name, used_ids)
-        asset["notes"] = {"content": "truststore only (CA bundle), no keystore found for it", **asset.get("notes", {})}
+        notes = asset.get("notes", {})
+        notes.pop("private_key", None)  # a CA bundle has no key of its own
+        asset["notes"] = {"content": "truststore only (CA bundle), no keystore found for it", **notes}
+        _note_backup(asset, name, backups)
         results.append((asset, comments))
     return results
+
+
+# _add_chain sets the asset's `chain` to the first CA chain key of the Secret, inserted
+# right after keystore/truststore so the YAML reads in a natural order.
+def _add_chain(asset: dict, secret_name: str, chains: list[dict]) -> None:
+    ordered = {}
+    for key, value in asset.items():
+        if key == "notes":
+            ordered["chain"] = {"secret": {"name": secret_name, "key": chains[0]["key"]}}
+        ordered[key] = value
+    ordered.setdefault("chain", {"secret": {"name": secret_name, "key": chains[0]["key"]}})
+    asset.clear()
+    asset.update(ordered)
+    if len(chains) > 1:
+        others = ", ".join(st["key"] for st in chains[1:])
+        asset.setdefault("notes", {})["chain"] = f"other CA keys in the Secret, not used: {others}"
+
+
+def _note_backup(asset: dict, secret_name: str, backups: dict) -> None:
+    if secret_name in backups:
+        notes = asset.setdefault("notes", {})
+        notes["backup"] = f"backup copy of Secret '{backups[secret_name]}'"
 
 
 def _build_asset(namespace, cluster_name, secret, ks, truststores, multiple, by_name, used_ids):
@@ -335,6 +439,12 @@ def _build_asset(namespace, cluster_name, secret, ks, truststores, multiple, by_
     note = _mtls_note(leaf, bool(truststores))
     if note:
         notes["mtls"] = note
+
+    # Where the private key is, as a fact: not opened stores (password unknown) say nothing.
+    if metas is not None:
+        location = private_key_location(ks["data"], ks["format"], _password_value(ks_pass, by_name), metas,
+                                        ks["key"], lambda: list(secret.data or {}))
+        notes["private_key"] = location or "not found next to the certificate"
 
     annotations = secret.metadata.annotations or {}
     if "cert-manager.io/certificate-name" in annotations:

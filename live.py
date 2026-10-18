@@ -1,7 +1,7 @@
 import logging
 
 import cluster
-from cert_analysis import cert_format, cert_metadata_extract, expiry_warning
+from cert_analysis import cert_format, cert_metadata_extract, expiry_warning, private_key_location, verify_issued_by
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +71,9 @@ def fetch_store_material(api, namespace: str, store: dict) -> tuple[bytes, str |
     return data, password
 
 
-# _fetch_store fetches a store and parses it. Returns (format, list of cert metadata).
-def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
+# _fetch_store fetches a store and parses it. Returns (format, list of cert metadata), plus
+# where the private key is (cert_analysis.private_key_location) when with_key is set.
+def _fetch_store(api, namespace: str, store: dict, with_key: bool = False):
     secret = store["secret"]
     data, password = fetch_store_material(api, namespace, store)
 
@@ -84,6 +85,10 @@ def _fetch_store(api, namespace: str, store: dict) -> tuple[str, list[dict]]:
         metas = [metas]
     if not metas:
         raise ValueError(f"no certificates found in Secret '{secret['name']}' key '{secret['key']}'")
+    if with_key:
+        location = private_key_location(data, fmt, password, metas, secret["key"],
+                                        lambda: cluster.secret_keys(namespace, secret["name"], api))
+        return fmt, metas, location
     return fmt, metas
 
 
@@ -131,7 +136,8 @@ def _cn_matches(yaml_cn: str, leaf: dict) -> bool:
 # warning (expired, not yet valid, or within warn_days): used by --fail-on-expiry.
 def inspect_asset(asset: dict, clients: ClusterClients, warn_days: int) -> dict:
     result = {"id": asset["id"], "context": clients.context_for(asset), "errors": [], "warnings": [],
-              "expiring": False, "keystore": None, "truststore": None, "leaf": None}
+              "expiring": False, "keystore": None, "truststore": None, "chain": None, "leaf": None,
+              "private_key": None, "chain_verified": None}
     namespace = asset["namespace"]
 
     try:
@@ -140,12 +146,15 @@ def inspect_asset(asset: dict, clients: ClusterClients, warn_days: int) -> dict:
         result["errors"].append(str(e))
         return result
 
-    for role in ("keystore", "truststore"):
+    for role in ("keystore", "truststore", "chain"):
         store = asset.get(role)
         if not isinstance(store, dict) or not isinstance(store.get("secret"), dict):
             continue
         try:
-            fmt, metas = _fetch_store(api, namespace, store)
+            if role == "keystore":
+                fmt, metas, result["private_key"] = _fetch_store(api, namespace, store, with_key=True)
+            else:
+                fmt, metas = _fetch_store(api, namespace, store)
         except (cluster.ClusterError, ValueError) as e:
             result["errors"].append(f"{role}: {e}")
             continue
@@ -177,19 +186,52 @@ def inspect_asset(asset: dict, clients: ClusterClients, warn_days: int) -> dict:
                 f"(CN '{leaf.get('common_name')}', SAN: {', '.join(leaf['san']) or 'none'})"
             )
 
+        if leaf is not None:
+            _check_chain(asset, result, leaf)
+
     if asset.get("mtls") and "truststore" not in asset:
         result["warnings"].append("mtls: true but no truststore is defined (peer certificates cannot be verified)")
+    if asset.get("mtls") and keystore and result["private_key"] is None:
+        result["warnings"].append("mtls: true but no private key was found with the certificate "
+                                  "(an mTLS endpoint needs its own key)")
 
     return result
+
+
+# _check_chain verifies, by signature, that the leaf was issued by a CA found in the
+# keystore itself or in the asset's separate `chain` Secret (the equivalent of
+# `openssl verify -CAfile chain.pem leaf.pem` for the first hop). chain_verified is True
+# when an issuer verifies, False when CA material exists but none signed the leaf, None
+# when there is no CA material at all (nothing to check). A self-signed leaf verifies
+# against itself.
+def _check_chain(asset: dict, result: dict, leaf: dict) -> None:
+    candidates = [m for m in result["keystore"]["certs"] if m is not leaf]
+    if result["chain"]:
+        candidates += result["chain"]["certs"]
+    if verify_issued_by(leaf, leaf):
+        result["chain_verified"] = True
+        return
+    if not candidates:
+        return
+    result["chain_verified"] = any(verify_issued_by(leaf, ca) for ca in candidates)
+    if not result["chain_verified"]:
+        where = (f"chain Secret '{result['chain']['secret']}/{result['chain']['key']}'"
+                 if result["chain"] else "keystore")
+        result["warnings"].append(f"the certificate is not signed by any CA in its {where} "
+                                  f"(issuer: {leaf['issuer']})")
 
 
 def print_inspection(result: dict) -> None:
     context = result["context"] or "(default)"
     print(f"Live: {result['id']}  (context: {context})")
-    for role in ("keystore", "truststore"):
+    for role in ("keystore", "truststore", "chain"):
         store = result[role]
         if store:
             print(f"  {role}: {store['secret']}/{store['key']}  [{store['format']}, {len(store['certs'])} cert(s)]")
+    if result["keystore"]:
+        print(f"  private key: {result['private_key'] or 'not found'}")
+    if result["chain_verified"] is not None:
+        print(f"  chain verified: {'yes' if result['chain_verified'] else 'no'}")
     leaf = result["leaf"]
     if leaf:
         print(f"  leaf: {leaf['subject']}")

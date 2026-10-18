@@ -77,6 +77,18 @@ def get_secret_key(namespace: str, name: str, key: str, api=None) -> bytes:
 
     return base64.b64decode(data[key])
 
+# secret_keys returns the key names of a Secret without decoding any value. Used to tell
+# whether a private key sits next to a certificate (tls.key) without reading the key.
+def secret_keys(namespace: str, name: str, api) -> list[str]:
+    try:
+        secret = api.read_namespaced_secret(name=name, namespace=namespace, _request_timeout=REQUEST_TIMEOUT)
+    except client.exceptions.ApiException as e:
+        raise ClusterError(f"failed to read Secret '{namespace}/{name}': HTTP {e.status} {e.reason}")
+    except Exception as e:
+        raise ClusterError(f"failed to read Secret '{namespace}/{name}': {e}")
+    return sorted((secret.data or {}).keys())
+
+
 # get_tls_password is a semantic alias for get_secret_key, named to make it
 # clear in the code when we're retrieving a password vs a cert/key.
 def get_tls_password(namespace: str, name: str, key: str, api=None) -> bytes:

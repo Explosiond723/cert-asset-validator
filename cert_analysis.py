@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from cryptography import x509
 from cryptography.x509.extensions import ExtensionNotFound
 from cryptography.x509.oid import NameOID
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.primitives.serialization import pkcs12
@@ -217,6 +218,9 @@ def _extract_cert_metadata(cert, alias: str = None, now: datetime = None) -> dic
     # key identifiers link a cert to the CA that signed it even when a renewed CA keeps the
     # same subject DN.
     metadata["fingerprint_sha256"] = cert.fingerprint(hashes.SHA256()).hex()
+    # The DER encoding, for signature checks (verify_issued_by). Keys starting with "_" are
+    # internal: never printed by `analyse` nor written anywhere.
+    metadata["_der"] = cert.public_bytes(serialization.Encoding.DER)
     try:
         metadata["subject_key_id"] = cert.extensions.get_extension_for_class(
             x509.SubjectKeyIdentifier).value.digest.hex()
@@ -237,9 +241,51 @@ def _extract_cert_metadata(cert, alias: str = None, now: datetime = None) -> dic
     return metadata
 
 
+# verify_issued_by checks cryptographically that `child` was signed by `issuer` (both
+# metadata dicts from _extract_cert_metadata): issuer name match plus signature, the
+# per-hop equivalent of `openssl verify -CAfile issuer.pem child.pem`.
+def verify_issued_by(child: dict, issuer: dict) -> bool:
+    try:
+        child_cert = x509.load_der_x509_certificate(child["_der"])
+        issuer_cert = x509.load_der_x509_certificate(issuer["_der"])
+        child_cert.verify_directly_issued_by(issuer_cert)
+        return True
+    except (KeyError, ValueError, TypeError, InvalidSignature):
+        return False
+
+
 # expiry_warning returns a one-line warning for a single cert's metadata, or None when the
 # cert is valid and has more than warn_days left. "Within N days" is inclusive: with
 # warn_days=30, a cert with exactly 30 days remaining is flagged.
+# is_private_key_name: Secret key names that hold a private key next to a certificate
+# (kubernetes.io/tls `tls.key`, `server.key`, `app-key.pem`, certbot `privkey.pem`).
+def is_private_key_name(key: str) -> bool:
+    lower = key.lower()
+    return lower.endswith(".key") or lower.endswith("-key.pem") or lower == "privkey.pem"
+
+
+# private_key_location tells where the private key of a keystore is: "in the keystore"
+# (JKS PrivateKeyEntry, PKCS12 key), "in the same file" (PEM with a PRIVATE KEY block) or
+# "in Secret key '<name>'" (another key of the same Secret, found by name only: its content
+# is never read). other_keys is a callable returning the key names of the Secret, called
+# only when needed. Returns None when no private key was found.
+# This is a fact about the material, not a verdict: every TLS server needs its private key,
+# mTLS or not.
+def private_key_location(data: bytes, fmt: str, password, metas, own_key: str, other_keys) -> str | None:
+    if fmt == "JKS":
+        return "in the keystore" if any(m.get("entry_type") == "PrivateKeyEntry" for m in metas or []) else None
+    if fmt == "PKCS12":
+        try:
+            key, _cert, _cas = pkcs12.load_key_and_certificates(data, password.encode() if password else None)
+        except ValueError:
+            return None
+        return "in the keystore" if key is not None else None
+    if fmt == "PEM" and b"PRIVATE KEY-----" in data:
+        return "in the same file"
+    sidecars = sorted(k for k in other_keys() if k != own_key and is_private_key_name(k))
+    return f"in Secret key '{sidecars[0]}'" if sidecars else None
+
+
 def expiry_warning(metadata: dict, warn_days: int) -> str | None:
     status = metadata.get("validity_status")
     if status == "expired":
