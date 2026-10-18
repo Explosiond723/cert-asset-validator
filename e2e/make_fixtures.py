@@ -13,6 +13,8 @@ Everything is signed by a throw-away test CA. Files written to OUTDIR:
   portal.crt / portal.key     portal.example.com, serverAuth+clientAuth, leaf only (the chain is
                               in a separate cacerts.pem, as in the renewal guide)
   portal-old.crt / .key       the previous portal.example.com certificate, kept in the -bck Secret
+  portal-new.crt / .key       the renewal used by the rotate scenarios: new key, extra SAN
+                              portal2.example.com (to recognise it once applied)
 """
 import sys
 from datetime import datetime, timedelta, timezone
@@ -55,7 +57,7 @@ def make_ca():
     return cert, key
 
 
-def make_leaf(ca, cn: str, not_before: datetime, not_after: datetime, ekus, key_type="rsa"):
+def make_leaf(ca, cn: str, not_before: datetime, not_after: datetime, ekus, key_type="rsa", extra_sans=()):
     ca_cert, ca_key = ca
     if key_type == "ec":
         key = ec.generate_private_key(ec.SECP256R1())
@@ -69,7 +71,7 @@ def make_leaf(ca, cn: str, not_before: datetime, not_after: datetime, ekus, key_
         .serial_number(x509.random_serial_number())
         .not_valid_before(not_before)
         .not_valid_after(not_after)
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(cn)]), critical=False)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(n) for n in (cn, *extra_sans)]), critical=False)
         .add_extension(x509.ExtendedKeyUsage(ekus), critical=False)
         .sign(ca_key, hashes.SHA256())
     )
@@ -126,6 +128,11 @@ def main(out: Path) -> None:
     old, old_key = make_leaf(ca, "portal.example.com", NOW - timedelta(days=300), NOW + timedelta(days=65), mtls)
     (out / "portal-old.crt").write_bytes(pem(old))
     (out / "portal-old.key").write_bytes(key_pem(old_key))
+
+    new, new_key = make_leaf(ca, "portal.example.com", NOW - timedelta(days=1), NOW + timedelta(days=730), mtls,
+                             extra_sans=("portal2.example.com",))
+    (out / "portal-new.crt").write_bytes(pem(new))
+    (out / "portal-new.key").write_bytes(key_pem(new_key))
 
     print(f"fixtures written to {out}")
 

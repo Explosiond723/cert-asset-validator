@@ -315,9 +315,25 @@ python main.py csr assets.yaml --id energia-api --live --reuse-key --cn energia-
 
 ---
 
-## Step 6: Cert rotation
+## Step 6: Cert rotation — PARTIAL (plan and manifests done, apply to do)
 
 Update a certificate across all secrets/namespaces where it appears. Supports direct apply and manifest generation.
+
+### What was implemented (first part: no cluster writes)
+
+`rotate.py` + `cmd_rotate`; tests in `tests/test_rotate.py` (fake API with apps) and scenarios in `e2e/kind.sh` that run the generated script on kind. Differences from the plan below:
+
+- `--cert` instead of `--new-cert`; `-k/--key` and `--chain` for the new key and CA chain. Without `--key`, the stored key is kept only if the new certificate uses it
+- the default is the plan (what `--dry-run` was meant to be); `-o DIR` is the manifest mode (`--output-only`): merge patches with `resourceVersion` (optimistic lock), backup manifests and `rotate.sh`. Direct apply is the next step
+- backup on by default (`-B/--no-backup`), restart opt-in (`-r/--restart`), following the renewal procedure in infrastructure-guides (§6: `<secret>-bck`, update, `openssl verify`, rollout restart)
+- the "before/after" is per Secret key: what is replaced, what is kept and why
+- no interactive prompt yet (nothing is applied)
+
+### Still to do
+
+- `--apply`: run the plan through the API (backup, patch, restart) with confirmation (`--yes` to skip), then re-inspect the assets
+- OpenShift DeploymentConfigs for `--restart`
+- Truststores pinning the old certificate are only reported
 
 ### Rotation flow
 
@@ -428,7 +444,7 @@ These are smaller enhancements to the existing `cert_analysis.py` that add value
 - ~~**JKS private key entries**~~ — DONE: `cert_metadata_extract` returns the cert chain of `PrivateKeyEntry` (leaf first, `entry_type: PrivateKeyEntry`) before `TrustedCertEntry` certs; metadata also carries `common_name`
 - ~~**PEM chain handling**~~ — DONE: `cert_metadata_extract` uses `load_pem_x509_certificates` (plural) to handle concatenated PEM chains
 - ~~**Expiration warnings**~~ — DONE (option A): `_extract_cert_metadata` adds `validity_status` (`valid` / `expired` / `not_yet_valid`), `days_remaining` (counted towards zero, negative once expired, always consistent with the label) and an `expiry` label to every cert's metadata, so `--live` and `map` get it for free. The threshold is applied separately by `expiry_warning(metadata, warn_days)`; `analyse --warn-days N` (default 30, inclusive) controls it. Warnings alone keep exit code 0; `--fail-on-expiry` (on `analyse`, and on `validate`/`search` with `--live`, where truststore certs count too) exits 1 instead, like `openssl x509 -checkend`. A plain 1 was chosen over Nagios-style distinct codes (2 is argparse's usage error); revisit if a monitoring system needs to tell "expiring" from "error".
-- **Self-signed detection** — Subject == Issuer check
+- ~~**Self-signed detection**~~ — DONE: `map` (AKI/SKI, else DN) and the chain check of `--live` (a self-signed leaf verifies against itself)
 - ~~**JKS magic-byte check**~~ — DONE: `cert_format` matches `0xFEEDFEED` (JKS) / `0xCECECECE` (JCEKS) without needing pyjks or the password, so a missing or wrong password is reported as such instead of "unable to detect certificate format"
 - **Cross-validation** — PARTIAL: with `--live`, detected format vs declared `certType`, YAML `cn` vs real CN/SANs, and `mtls` without truststore are checked; EKU vs `mtls` is not (a server cert in an mTLS setup legitimately has only serverAuth)
 
@@ -437,11 +453,11 @@ These are smaller enhancements to the existing `cert_analysis.py` that add value
 ## Implementation order
 
 1. **Step 1 (multi-cluster schema)** — DONE
-2. **Step 2 (cluster connectivity)** — DONE (wired into `validate --live` and `search --live`; still to test against a real cluster, e.g. kind)
+2. **Step 2 (cluster connectivity)** — DONE (wired into `validate --live` and `search --live`; tested on kind by the CI `e2e-kind` job)
 3. **Step 3 (search/query)** — DONE (offline and `--live`)
 4. **Step 4 (cross-reference map)** — DONE (`map`)
 5. **Step 5 (CSR generation)** — DONE (file and `--live`, subject/SAN edits, key reuse)
-6. **Step 6 (cert rotation)** — depends on cross-reference map + connectivity; the most operationally impactful feature
+6. **Step 6 (cert rotation)** — PARTIAL: plan and manifests (`rotate`, `-o`); direct apply to do
 7. **Step 7 (auto-discovery)** — DONE (`discover`)
 
 Steps 1-3 are the minimum viable product for daily use. Steps 4-5 make it genuinely valuable. Steps 6-7 make it a full lifecycle tool.

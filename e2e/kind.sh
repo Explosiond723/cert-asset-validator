@@ -78,6 +78,22 @@ up() {
         --from-file=tls.crt="$c/portal-old.crt" --from-file=tls.key="$c/portal-old.key" \
         --from-file=cacerts.pem="$c/cacerts.pem"
 
+    # a workload using portal-tls, for `rotate --restart` (0 replicas: nothing to pull or run)
+    kc apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: portal, namespace: portal-prod}
+spec:
+  replicas: 0
+  selector: {matchLabels: {app: portal}}
+  template:
+    metadata: {labels: {app: portal}}
+    spec:
+      containers: [{name: portal, image: registry.k8s.io/pause:3.9,
+                    volumeMounts: [{name: tls, mountPath: /tls}]}]
+      volumes: [{name: tls, secret: {secretName: portal-tls}}]
+EOF
+
     # restricted: readable by the admin context only
     apply_secret tls restricted-tls -n restricted --cert "$c/web.crt" --key "$c/web.key"
 
@@ -202,6 +218,21 @@ assets:
     cn: www.example.com
     certType: pem
     keystore: {secret: {name: web-tls, key: tls.crt}}
+EOF
+
+    # the portal asset alone, to check it after `rotate` with a clean exit code
+    cat > "$OUT/portal-only.yaml" <<EOF
+clusters:
+  - name: kind-admin
+    context: $ADMIN_CTX
+assets:
+  - id: portal
+    cluster: kind-admin
+    namespace: portal-prod
+    cn: portal.example.com
+    certType: pem
+    keystore: {secret: {name: portal-tls, key: tls.crt}}
+    chain: {secret: {name: portal-tls, key: cacerts.pem}}
 EOF
 
     echo
@@ -419,6 +450,40 @@ run() {
         reject "same name, different certificate"
         scenario 0 "map --view certificates --cn portal on the discovered inventory: backup recognised" \
             "${main[@]}" map "$OUT/discovered.yaml" --kubeconfig "$KCFG" --view certificates --cn portal
+        # rotate: plan, write the manifests, run the generated script against the real API
+        # server (this is a throw-away cluster), then check the result. Kept last: it changes
+        # portal-tls for good.
+        local stamp
+        stamp="$(date -u +%Y%m%d)"
+        expect "held by: portal" "tls.crt: replace (certificate, PEM)" "tls.key: replace (private key)" \
+            "cacerts.pem: unchanged (its CA signed the new certificate)" \
+            "backup: portal-tls-bck-$stamp (created before the change)" "restart: deployment/portal" \
+            "Dry run: add -o DIR"
+        reject "PRIVATE KEY" "ERROR"
+        scenario 0 "rotate --id portal (dry run): -bck exists, so the backup gets a dated name; restart found" \
+            "${main[@]}" rotate "$inv" -i portal --cert "$OUT/certs/portal-new.crt" -k "$OUT/certs/portal-new.key" -r \
+            --kubeconfig "$KCFG"
+        expect "Written to rotation:" "rotate.sh" "do not commit them"
+        scenario 0 "rotate -o rotation: patch, backup manifest and rotate.sh written" \
+            "${main[@]}" rotate "$inv" -i portal --cert "$OUT/certs/portal-new.crt" -k "$OUT/certs/portal-new.key" -r \
+            --kubeconfig "$KCFG" -o rotation
+        expect "portal-tls-bck-$stamp created" "secret/portal-tls patched" "deployment.apps/portal restarted"
+        scenario 0 "rotate.sh against the cluster: backup, patch (resourceVersion checked), rollout restart" \
+            bash rotation/rotate.sh
+        expect "DNS:portal2.example.com" "chain verified: yes" "private key: in Secret key 'tls.key'"
+        reject "ERROR" "not signed"
+        scenario 0 "after rotate: portal serves the new certificate, chain and key still consistent" \
+            "${main[@]}" validate "$OUT/portal-only.yaml" "${live[@]}"
+        expect "kubectl.kubernetes.io/restartedAt"
+        scenario 0 "after rotate: the Deployment was restarted" \
+            kc get deployment portal -n portal-prod -o jsonpath='{.spec.template.metadata.annotations}'
+        expect "already exists"
+        reject "patched"
+        scenario 1 "rotate.sh run twice: the backup already exists, so it stops before patching" \
+            bash rotation/rotate.sh
+        expect "already in place"
+        scenario 1 "rotate again with the same certificate: refused" \
+            "${main[@]}" rotate "$inv" -i portal --cert "$OUT/certs/portal-new.crt" --kubeconfig "$KCFG"
         expect "PrivateKeyEntry" "CN=api.example.com" "DNS:api.example.com"
         scenario 0 "analyse the generated CSR inputs: JKS keystore from disk" \
             "${main[@]}" analyse "$OUT/certs/api-keystore.jks" --password changeit --format table
