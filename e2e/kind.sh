@@ -347,6 +347,23 @@ run() {
             "discovered 3 asset(s) in 1 namespace(s), 1 namespace(s) skipped"
         scenario 1 "discover with the limited identity: web-prod readable, api-prod denied" \
             "${main[@]}" discover -n web-prod -n api-prod --kubeconfig "$KCFG" --context "$LIMITED_CTX"
+        # map: the fixture certs have no key identifiers, so CA linkage uses the DN fallback
+        expect "CA: O=cert-asset-validator e2e,CN=e2e Test CA" \
+            "signs: api, billing, legacy, mismatch, web, web-limited" \
+            "trusted by: api"
+        reject "CA (not in the inventory)"
+        scenario 1 "map --view cas: one CA signs every leaf (errors from the 3 broken assets)" \
+            "${main[@]}" map "$inv" --kubeconfig "$KCFG" --view cas
+        # with the admin context everywhere, the www certificate is readable in 4 assets
+        expect "Certificate: O=cert-asset-validator e2e,CN=www.example.com" "found in 4 place(s):" \
+            "kind-limited / restricted / restricted-tls (tls.crt)  [asset restricted, keystore]"
+        reject "same name, different certificate"
+        scenario 0 "map --view certificates --cn www: same certificate in 4 places" \
+            "${main[@]}" map "$inv" --kubeconfig "$KCFG" --context "$ADMIN_CTX" --view certificates --cn www
+        expect "truststore trusts its own CA: yes" "chain complete: no" "chain complete: yes" \
+            "same certificate also used by: ghost, restricted, web-limited"
+        scenario 1 "map --view assets: chains, truststore, shared certificates" \
+            "${main[@]}" map "$inv" --kubeconfig "$KCFG" --context "$ADMIN_CTX" --view assets
         expect "PrivateKeyEntry" "CN=api.example.com" "DNS:api.example.com"
         scenario 0 "analyse the generated CSR inputs: JKS keystore from disk" \
             "${main[@]}" analyse "$OUT/certs/api-keystore.jks" --password changeit --format table

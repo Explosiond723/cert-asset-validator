@@ -11,7 +11,7 @@ A certificate lifecycle management tool for Kubernetes/OpenShift environments. M
 - `cert_format(data, path, optional_password)` — probes raw bytes: PEM → DER → JKS/JCEKS (magic number) → PKCS12
 - `cert_metadata_extract(data, cert_type, optional_password)` — returns subject, issuer, serial, validity, SANs, EKU
 - `mtls_candidate(metadata)` → `(bool, reason)` — mTLS client hint from the **leaf** EKU only: `clientAuth`, or no EKU extension (RFC 5280: any usage), makes it a candidate; an EKU without `clientAuth`, a CA, or no leaf (truststore) does not. `eku_inspect()` is its boolean wrapper. Metadata now carries `is_ca` (Basic Constraints)
-- `_extract_cert_metadata(cert, alias, now)` — shared helper for consistent extraction; SANs rendered openssl-style (`DNS:`, `IP:`, `email:`, `URI:`, ...; `otherName:UPN:user@example.com`, hex for non-text otherName values), EKUs by short name (dotted OID when unknown), plus expiry fields
+- `_extract_cert_metadata(cert, alias, now)` — shared helper for consistent extraction (includes `fingerprint_sha256`, `subject_key_id`, `authority_key_id`, `is_ca`); SANs rendered openssl-style (`DNS:`, `IP:`, `email:`, `URI:`, ...; `otherName:UPN:user@example.com`, hex for non-text otherName values), EKUs by short name (dotted OID when unknown), plus expiry fields
 - `expiry_warning(metadata, warn_days)` — one-line warning for expired, not-yet-valid, or soon-to-expire certs
 - `pyjks` is imported lazily: PEM/DER/PKCS12 analysis works without it
 
@@ -202,7 +202,18 @@ python main.py search assets.yaml --namespace energia-prod --cn "api"
 
 ---
 
-## Step 4: Cross-reference map
+## Step 4: Cross-reference map — DONE
+
+Implemented in `certmap.py` + `cmd_map` (`main.py map`), built on `live.inspect_asset`; tests in `tests/test_map.py` (fake API, a PKI with a CA renewal) and three scenarios in `e2e/kind.sh` (DN fallback, same cert in 4 places, relationships).
+
+### What was implemented (differences from the plan below)
+
+- Identity is the SHA-256 fingerprint rather than serial + issuer (exact, and what openssl shows). Metadata now carries `fingerprint_sha256`, `subject_key_id`, `authority_key_id`
+- Added: "same name, different certificate" detection across the inventory (rotation drift)
+- CA linkage by AKI/SKI with DN fallback; CAs with the same DN and different keys are flagged
+- "Orphan CA certs" is interpreted as trusted CAs that sign nothing in the inventory; CAs stored in Secrets outside the inventory are `discover`'s job
+- `map` always connects (no `--live` flag, like `discover`); `--ca-only` became `--view cas`
+
 
 The most operationally valuable feature: show where the same certificate lives across the entire inventory, which CAs are present, and how keystores/truststores relate.
 
@@ -419,7 +430,7 @@ These are smaller enhancements to the existing `cert_analysis.py` that add value
 1. **Step 1 (multi-cluster schema)** — DONE
 2. **Step 2 (cluster connectivity)** — DONE (wired into `validate --live` and `search --live`; still to test against a real cluster, e.g. kind)
 3. **Step 3 (search/query)** — DONE (offline and `--live`)
-4. **Step 4 (cross-reference map)** — the high-value feature; depends on connectivity
+4. **Step 4 (cross-reference map)** — DONE (`map`)
 5. **Step 5 (CSR generation)** — DONE (file and `--live`, subject/SAN edits, key reuse)
 6. **Step 6 (cert rotation)** — depends on cross-reference map + connectivity; the most operationally impactful feature
 7. **Step 7 (auto-discovery)** — DONE (`discover`)
