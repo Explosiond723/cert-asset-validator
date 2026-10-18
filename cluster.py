@@ -55,9 +55,21 @@ def connect(config_file: str = None, context: str = None) -> client.ApiClient:
 # Raises ClusterError if the Secret or key does not exist, or if the identity in use
 # lacks `get` permission on secrets in the target namespace.
 def get_secret_key(namespace: str, name: str, key: str, api=None) -> bytes:
-    api = api or client.CoreV1Api()
+    secret = read_secret(namespace, name, api or client.CoreV1Api())
+
+    # secret.data is None when the Secret has no data at all
+    data = secret.data or {}
+    if key not in data:
+        raise ClusterError(f"Secret '{namespace}/{name}' does not contain key '{key}'")
+
+    return base64.b64decode(data[key])
+
+
+# read_secret returns the whole Secret object (data still base64-encoded, metadata with
+# resourceVersion, type). Raises ClusterError with a readable message.
+def read_secret(namespace: str, name: str, api):
     try:
-        secret = api.read_namespaced_secret(name=name, namespace=namespace, _request_timeout=REQUEST_TIMEOUT)
+        return api.read_namespaced_secret(name=name, namespace=namespace, _request_timeout=REQUEST_TIMEOUT)
     except client.exceptions.ApiException as e:
         if e.status == 404:
             raise ClusterError(f"Secret '{namespace}/{name}' not found")
@@ -70,12 +82,17 @@ def get_secret_key(namespace: str, name: str, key: str, api=None) -> bytes:
     except Exception as e:  # network errors, TLS errors, timeouts from urllib3
         raise ClusterError(f"failed to read Secret '{namespace}/{name}': {e}")
 
-    # secret.data is None when the Secret has no data at all
-    data = secret.data or {}
-    if key not in data:
-        raise ClusterError(f"Secret '{namespace}/{name}' does not contain key '{key}'")
 
-    return base64.b64decode(data[key])
+# secret_exists tells whether a Secret exists (`get` on secrets): rotate uses it to pick a
+# backup name that is free.
+def secret_exists(namespace: str, name: str, api) -> bool:
+    try:
+        read_secret(namespace, name, api)
+        return True
+    except ClusterError as e:
+        if str(e).endswith("not found"):
+            return False
+        raise
 
 # secret_keys returns the key names of a Secret without decoding any value. Used to tell
 # whether a private key sits next to a certificate (tls.key) without reading the key.
@@ -131,3 +148,44 @@ def current_context(config_file: str = None):
         return active["name"] if active else None
     except (config.ConfigException, OSError):
         return None
+
+
+WORKLOAD_KINDS = (("deployment", "list_namespaced_deployment"), ("statefulset", "list_namespaced_stateful_set"),
+                  ("daemonset", "list_namespaced_daemon_set"))
+
+
+def _pod_spec_uses_secret(spec, secret: str) -> bool:
+    for volume in spec.volumes or []:
+        if volume.secret and volume.secret.secret_name == secret:
+            return True
+        for source in (volume.projected.sources or []) if volume.projected else []:
+            if source.secret and source.secret.name == secret:
+                return True
+    for container in (spec.containers or []) + (spec.init_containers or []):
+        for env in container.env or []:
+            ref = env.value_from.secret_key_ref if env.value_from else None
+            if ref and ref.name == secret:
+                return True
+        for env_from in container.env_from or []:
+            if env_from.secret_ref and env_from.secret_ref.name == secret:
+                return True
+    return False
+
+
+# workloads_using_secret lists the Deployments, StatefulSets and DaemonSets of a namespace
+# whose pods mount or read the Secret, as "kind/name" (what `kubectl rollout restart`
+# takes). core_api is a CoreV1Api: the apps client shares its connection. Needs RBAC `list`
+# on those resources. OpenShift DeploymentConfigs are not covered.
+def workloads_using_secret(namespace: str, secret: str, core_api) -> list[str]:
+    apps = getattr(core_api, "apps_api", None) or client.AppsV1Api(core_api.api_client)
+    found = []
+    for kind, method in WORKLOAD_KINDS:
+        try:
+            items = getattr(apps, method)(namespace=namespace, _request_timeout=REQUEST_TIMEOUT).items
+        except client.exceptions.ApiException as e:
+            raise _api_error(f"{kind}s in namespace '{namespace}'", e)
+        except Exception as e:
+            raise ClusterError(f"failed to list {kind}s in namespace '{namespace}': {e}")
+        found += [f"{kind}/{item.metadata.name}" for item in items
+                  if _pod_spec_uses_secret(item.spec.template.spec, secret)]
+    return sorted(found)

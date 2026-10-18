@@ -55,7 +55,7 @@ def _self_signed(meta: dict) -> bool:
 # assets view with their errors and contribute nothing else.
 def build_map(pairs: list[tuple[dict, dict]], warn_days: int, backup_words=BACKUP_WORDS) -> dict:
     certs = {}  # fingerprint -> {"meta", "positions": set, "locations": [...]}
-    backups = _backups(pairs, backup_words)  # asset id -> Secret it is a backup of
+    backups = find_backups(pairs, backup_words)  # asset id -> Secret it is a backup of
 
     def add(meta, position, loc):
         entry = certs.setdefault(meta["fingerprint_sha256"], {"meta": meta, "positions": set(), "locations": []})
@@ -223,7 +223,7 @@ def build_map(pairs: list[tuple[dict, dict]], warn_days: int, backup_words=BACKU
 
 # _backups finds the assets whose keystore Secret is a backup copy of another Secret of the
 # inventory in the same cluster and namespace (or that discover marked with a backup note).
-def _backups(pairs, words) -> dict:
+def find_backups(pairs, words) -> dict:
     names = {}
     for asset, _result in pairs:
         secret = _keystore_secret(asset)

@@ -82,9 +82,37 @@ python main.py map inventory.yaml
 python main.py map inventory.yaml --view cas
 python main.py map inventory.yaml --cn api.example.com --view certificates
 python main.py map inventory.yaml --view assets --format csv > relationships.csv
+
+# Rotation: see what a renewed certificate would change everywhere the current one lives
+# (nothing is written to the cluster), then write the manifests and the kubectl script
+python main.py rotate inventory.yaml -i portal --cert portal-new.crt -k portal-new.key
+python main.py rotate inventory.yaml -i portal --cert portal-new.crt -k portal-new.key -r -o rotation/
+bash rotation/rotate.sh        # after reviewing it
+
+# Short options: the same letter means the same thing in every command
+python main.py search inventory.yaml -l -n energia-prod -f table
 ```
 
 Running `python main.py` with no arguments prints usage help.
+
+| Short | Long | Commands |
+|---|---|---|
+| `-n` | `--namespace` | search, discover |
+| `-A` | `--all-namespaces` | discover |
+| `-l` | `--live` | validate, search, csr |
+| `-c` | `--context` | validate, search, csr, discover, map, rotate |
+| `-f` | `--format` | validate, analyse, search, map |
+| `-o` | `--output` | csr, discover, rotate |
+| `-u` | `--update` | discover |
+| `-p` | `--password` | analyse, csr |
+| `-i` | `--id` | csr, rotate |
+| `-k` | `--key` | csr, rotate |
+| `-w` | `--warn-days` | validate, analyse, search, map, rotate |
+| `-s` | `--secret` | search |
+| `-C` | `--cluster` | search |
+| `-r` | `--restart` | rotate |
+| `-B` | `--no-backup` | rotate |
+| `-v` | `--verbose` | all |
 
 ## Features
 
@@ -126,13 +154,20 @@ Running `python main.py` with no arguments prints usage help.
   - **cas**: every CA in the inventory with the certificates it signed, who trusts it (truststores) and whose chain carries it; issuers that appear nowhere in the inventory are listed too. Certificates are linked to their CA by key identifier (AKI/SKI), with the DN as fallback, so a renewed CA with the same name is told apart (and flagged)
   - **assets**: per asset, whether the chain (keystore or `chain` Secret) contains the issuing CA — verified by signature —, where the private key is, whether it is a backup copy, whether the truststore trusts the asset's own CA, which trusted CAs sign nothing in the inventory, and which other assets use the same certificate
   - `--cn` limits the map to assets whose YAML cn or real CN/SANs match; exit 1 if any asset could not be read
+- **Rotation plan** (`rotate`) — replaces one certificate everywhere it lives. **It never writes to the clusters**: it shows the plan and, with `-o DIR`, writes the files to apply after review:
+  - targets: every asset whose current certificate has the same fingerprint as the one of `--id` (or of the assets matching `--cn`, which must all hold the same certificate), as in `map`. Backup copies are left alone and listed; unreadable assets and truststores pinning the old certificate are listed too
+  - the new certificate (`--cert`, PEM or DER; a PEM can carry its chain) is checked first: not expired or not yet valid, no DNS/IP SAN of the current one dropped (`--allow-san-removal` to accept it), later expiry and CN change reported, key matching the certificate
+  - the stored material is rebuilt **in the same layout**: PEM `tls.crt` with or without the chain in it, key in the same file or in `tls.key`, DER, PKCS12 and JKS with the same password (JKS keeps its other entries). The chain inside a store or in the `chain` Secret is kept when its CA signed the new certificate, replaced by `--chain` otherwise. Without `-k/--key` the stored key is kept when the new certificate uses it (CSR made with `--reuse-key`); a new key is required otherwise
+  - backup **on by default**, as in the renewal procedure: a copy of each Secret as `<secret>-bck` (`-bck-YYYYMMDD` when that exists), created before the change, without the original labels/annotations so operators do not act on it. `-B/--no-backup` disables it
+  - restart **off by default**: `-r/--restart` adds `kubectl rollout restart` for the Deployments, StatefulSets and DaemonSets whose pods mount or read the Secret (OpenShift DeploymentConfigs are not checked)
+  - `-o DIR` writes `<cluster>/<namespace>/<secret>.patch.json` (merge patch with only the changed keys and the `resourceVersion` read at planning time: the API refuses it if the Secret changed meanwhile), `<secret>-bck-*.yaml` and `rotate.sh` (`set -euo pipefail`: a backup that cannot be created stops the patch after it). Files are `0600` in a `0700` directory with a `.gitignore` of `*`: they hold private keys and Secret values. For GitOps, encrypt them (SOPS, Sealed Secrets) before committing
+  - a Secret managed by cert-manager is flagged: a manual change is overwritten at its next renewal
 - **Notes** (`notes:` on an asset, optional) — free-form `key: text` pairs, written by `discover` and editable by hand (e.g. `owner: team-payments`). In `--format csv` every key becomes a `notes_<key>` column, ready for spreadsheet filtering; `table` shows a `notes` column listing the keys; `validate` (list) prints them
 - **Output formats** (`--format list|table|csv` on `validate`, `search` and `analyse`) — `list` is the default human-readable layout; `table` is an aligned view; `csv` carries every field, one row per asset or certificate, multi-value cells joined with `; `
 
 ### Planned
 
-- **Cert rotation** — update a cert across all secrets/namespaces where it appears, with direct apply or manifest generation for GitOps
-- **Cert rotation** with `--live` — push a renewed certificate into every Secret where it lives
+- **Rotation apply** — `rotate --apply`: the same plan applied directly (backup, patch, restart, then a live check), with confirmation
 
 See `ROADMAP.md` for the detailed implementation plan.
 
@@ -181,14 +216,14 @@ It can also be started by hand from the Actions tab (`Run workflow`).
 `e2e/kind.sh` runs `--live` against a real API server on a local [kind](https://kind.sigs.k8s.io/) cluster (requires docker or podman, kind, kubectl):
 
 ```bash
-e2e/kind.sh up     # cluster, Secrets (PEM, JKS, PKCS12, expired, mismatched, chain + -bck), RBAC, e2e/out/inventory.yaml
+e2e/kind.sh up     # cluster, Secrets (PEM, JKS, PKCS12, expired, mismatched, chain + -bck), a Deployment, RBAC, inventory
 e2e/kind.sh run    # scenarios with expected exit codes; log in e2e/out/run.log
 e2e/kind.sh down   # delete the cluster and e2e/out/
 ```
 
 Each scenario checks the exit code **and** the output: the messages it must print (`expect`), those it must not (`reject`), and no Python traceback, so a crash cannot pass for an expected failure. Two scenarios also look inside the results: the subject and SANs of the generated CSRs, and the `passwordRef`s, `chain` and notes written by `discover`. The harness itself is tested in `tests/test_e2e_harness.py`.
 
-It uses its own kubeconfig (`e2e/out/kubeconfig`), so `~/.kube/config` is not modified. The inventory covers OK assets, expiry warnings, YAML/cluster mismatches, a missing Secret, an RBAC denial through a limited ServiceAccount, an unknown context, and the renewal-guide layout (generic Secret with `tls.crt` + `tls.key` + `cacerts.pem`, plus its `-bck` copy holding the previous certificate).
+It uses its own kubeconfig (`e2e/out/kubeconfig`), so `~/.kube/config` is not modified. The inventory covers OK assets, expiry warnings, YAML/cluster mismatches, a missing Secret, an RBAC denial through a limited ServiceAccount, an unknown context, and the renewal-guide layout (generic Secret with `tls.crt` + `tls.key` + `cacerts.pem`, plus its `-bck` copy holding the previous certificate). The last scenarios run `rotate` on it and execute the generated `rotate.sh` against the cluster: backup, patch, rollout restart, then a live check of the new certificate, and a second run that must stop on the existing backup.
 
 ## Configuration model
 
