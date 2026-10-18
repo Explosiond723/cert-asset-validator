@@ -7,8 +7,13 @@ Secrets), it answers three questions:
   - CAs: which CAs are present, which certificates did each sign, who trusts them?
   - assets: is each keystore chain complete, does its truststore trust its own CA, which
     trusted CAs sign nothing in the inventory?
+Backup copies of Secrets (api-tls-bck, see discover.backup_of) are recognised, so that the
+old certificate kept in a backup is not reported as a renewal missing somewhere.
 """
+import re
+
 from cert_analysis import expiry_warning
+from discover import BACKUP_WORDS, backup_of
 
 LEAF, CHAIN, TRUSTED = "leaf", "chain", "trusted"
 
@@ -48,13 +53,14 @@ def _self_signed(meta: dict) -> bool:
 # build_map turns inspection results into the three views. `pairs` is a list of
 # (asset dict, inspect_asset result). Assets whose inspection failed are kept in the
 # assets view with their errors and contribute nothing else.
-def build_map(pairs: list[tuple[dict, dict]], warn_days: int) -> dict:
+def build_map(pairs: list[tuple[dict, dict]], warn_days: int, backup_words=BACKUP_WORDS) -> dict:
     certs = {}  # fingerprint -> {"meta", "positions": set, "locations": [...]}
+    backups = _backups(pairs, backup_words)  # asset id -> Secret it is a backup of
 
     def add(meta, position, loc):
         entry = certs.setdefault(meta["fingerprint_sha256"], {"meta": meta, "positions": set(), "locations": []})
         entry["positions"].add(position)
-        entry["locations"].append(dict(loc, position=position))
+        entry["locations"].append(dict(loc, position=position, backup=loc["asset"] in backups))
 
     leaves = {}  # asset id -> leaf meta
     for asset, result in pairs:
@@ -73,6 +79,11 @@ def build_map(pairs: list[tuple[dict, dict]], warn_days: int) -> dict:
             loc = _location(result, asset, "truststore")
             for meta in ts["certs"]:
                 add(meta, TRUSTED, loc)
+        chain_store = result.get("chain")
+        if chain_store:
+            loc = _location(result, asset, "chain")
+            for meta in chain_store["certs"]:
+                add(meta, CHAIN, loc)
 
     # --- CAs: every CA certificate seen anywhere, keyed so that issuers can be matched
     cas = {}
@@ -105,6 +116,11 @@ def build_map(pairs: list[tuple[dict, dict]], warn_days: int) -> dict:
             missing_issuers.setdefault(leaf["issuer"], []).append(asset_id)
 
     # --- certificates view: the identity certs (leaves), with the other places they live
+    # A version found only in backups is the expected leftover of a renewal, not a renewal
+    # missing somewhere: it is not listed as another version of the current certificate.
+    def backup_only(entry):
+        return all(loc["backup"] for loc in entry["locations"] if loc["position"] == LEAF)
+
     by_cn = {}
     for fp, entry in certs.items():
         if LEAF in entry["positions"] and entry["meta"].get("common_name"):
@@ -116,6 +132,10 @@ def build_map(pairs: list[tuple[dict, dict]], warn_days: int) -> dict:
             continue
         meta = entry["meta"]
         versions = by_cn.get((meta.get("common_name") or "").lower(), {fp})
+        only_backup = backup_only(entry)
+        others = sorted(versions - {fp})
+        if not only_backup:
+            others = [f for f in others if not backup_only(certs[f])]
         cert_rows.append({
             "fingerprint": fp, "subject": meta["subject"], "common_name": meta.get("common_name"),
             "issuer": meta["issuer"], "serial_number": meta["serial_number"],
@@ -124,7 +144,7 @@ def build_map(pairs: list[tuple[dict, dict]], warn_days: int) -> dict:
             "warning": expiry_warning(meta, warn_days),
             "locations": entry["locations"],
             "assets": sorted({loc["asset"] for loc in entry["locations"]}),
-            "other_versions": sorted(versions - {fp}),
+            "other_versions": others, "backup_only": only_backup,
         })
     cert_rows.sort(key=lambda r: ((r["common_name"] or "").lower(), r["not_valid_after"]))
 
@@ -161,20 +181,32 @@ def build_map(pairs: list[tuple[dict, dict]], warn_days: int) -> dict:
         row = {"id": asset["id"], "cluster": asset.get("cluster"), "namespace": asset["namespace"],
                "leaf": leaf["subject"] if leaf else None, "issuer": leaf["issuer"] if leaf else None,
                "issuer_in_inventory": None, "chain_complete": None, "truststore_trusts_own_ca": None,
-               "unused_trusted_cas": [], "shared_with": [], "errors": list(result.get("errors", []))}
+               "unused_trusted_cas": [], "shared_with": [], "private_key": result.get("private_key"),
+               "chain_source": None, "backup_of": backups.get(asset["id"]),
+               "errors": list(result.get("errors", []))}
         if leaf:
             fp = leaf["fingerprint_sha256"]
             row["shared_with"] = sorted({loc["asset"] for loc in certs[fp]["locations"]
                                          if loc["position"] == LEAF} - {asset["id"]})
+            chain_store = result.get("chain")
+            chain = [m for m in result["keystore"]["certs"] if m is not leaf]
+            if chain_store:
+                row["chain_source"] = f"Secret {chain_store['secret']} ({chain_store['key']})"
+                chain += chain_store["certs"]
+            elif chain:
+                row["chain_source"] = "keystore"
             if _self_signed(leaf):
                 row["issuer_in_inventory"] = "self-signed"
                 row["chain_complete"] = True
             else:
                 issuer_ca = _find_ca(cas, leaf)
                 row["issuer_in_inventory"] = "yes" if issuer_ca else "no"
-                chain = result["keystore"]["certs"]
-                row["chain_complete"] = bool(issuer_ca) and any(
-                    m["fingerprint_sha256"] in issuer_ca["fingerprints"] for m in chain if m is not leaf)
+                if result.get("chain_verified") is not None:
+                    # checked by signature in live.inspect_asset
+                    row["chain_complete"] = result["chain_verified"]
+                else:
+                    row["chain_complete"] = bool(issuer_ca) and any(
+                        m["fingerprint_sha256"] in issuer_ca["fingerprints"] for m in chain)
             ts = result.get("truststore")
             if ts:
                 trusted_keys = {_ca_key(m) for m in ts["certs"]}
@@ -187,6 +219,33 @@ def build_map(pairs: list[tuple[dict, dict]], warn_days: int) -> dict:
         asset_rows.append(row)
 
     return {"certificates": cert_rows, "cas": ca_rows, "assets": asset_rows}
+
+
+# _backups finds the assets whose keystore Secret is a backup copy of another Secret of the
+# inventory in the same cluster and namespace (or that discover marked with a backup note).
+def _backups(pairs, words) -> dict:
+    names = {}
+    for asset, _result in pairs:
+        secret = _keystore_secret(asset)
+        if secret:
+            names.setdefault((asset.get("cluster"), asset["namespace"]), set()).add(secret)
+    found = {}
+    for asset, _result in pairs:
+        secret = _keystore_secret(asset)
+        original = backup_of(secret, names[(asset.get("cluster"), asset["namespace"])], words) if secret else None
+        if original:
+            found[asset["id"]] = original
+        elif isinstance(asset.get("notes"), dict) and asset["notes"].get("backup"):
+            note = str(asset["notes"]["backup"])
+            match = re.search(r"Secret '([^']+)'", note)
+            found[asset["id"]] = match.group(1) if match else note
+    return found
+
+
+def _keystore_secret(asset: dict):
+    store = asset.get("keystore")
+    secret = store.get("secret") if isinstance(store, dict) else None
+    return secret.get("name") if isinstance(secret, dict) else None
 
 
 def _find_ca(cas: dict, leaf: dict):
@@ -213,12 +272,16 @@ def print_map(report: dict, views: list[str]) -> None:
                 print(f"  san: {', '.join(row['san'])}")
             print(f"  found in {len(row['locations'])} place(s):")
             for loc in row["locations"]:
-                print(f"    - {_where(loc)}  [asset {loc['asset']}, {loc['role']}]")
+                backup = ", backup" if loc["backup"] else ""
+                print(f"    - {_where(loc)}  [asset {loc['asset']}, {loc['role']}{backup}]")
             if row["warning"]:
-                print(f"  WARNING: {row['warning']}")
+                print(f"  {'NOTE (backup copy)' if row['backup_only'] else 'WARNING'}: {row['warning']}")
             if row["other_versions"]:
                 others = ", ".join(_short(f) for f in row["other_versions"])
-                print(f"  WARNING: same name, different certificate(s) elsewhere: {others}")
+                if row["backup_only"]:
+                    print(f"  NOTE: found only in backups; current version(s): {others}")
+                else:
+                    print(f"  WARNING: same name, different certificate(s) elsewhere: {others}")
             print("----")
     if "cas" in views:
         print("== CAs ==")
@@ -247,10 +310,14 @@ def print_map(report: dict, views: list[str]) -> None:
                     print(f"  ERROR: {error}")
                 print("----")
                 continue
+            if row["backup_of"]:
+                print(f"  backup of: {row['backup_of']}")
             if row["leaf"]:
                 print(f"  leaf: {row['leaf']}")
                 print(f"  issuer: {row['issuer']} (in inventory: {row['issuer_in_inventory']})")
-                print(f"  chain complete: {'yes' if row['chain_complete'] else 'no'}")
+                source = f" (from {row['chain_source']})" if row["chain_source"] else ""
+                print(f"  chain complete: {'yes' if row['chain_complete'] else 'no'}{source}")
+                print(f"  private key: {row['private_key'] or 'not found'}")
             if row["truststore_trusts_own_ca"] is not None:
                 print(f"  truststore trusts its own CA: {row['truststore_trusts_own_ca']}")
             if row["unused_trusted_cas"]:
@@ -263,16 +330,18 @@ def print_map(report: dict, views: list[str]) -> None:
 # table_rows flattens one view for --format table/csv: (rows, columns).
 def table_rows(report: dict, view: str) -> tuple[list[dict], list[str]]:
     if view == "certificates":
-        rows = [dict(r, locations=[_where(loc) for loc in r["locations"]], places=len(r["locations"]),
+        rows = [dict(r, locations=[_where(loc) + (" [backup]" if loc["backup"] else "") for loc in r["locations"]],
+                     places=len(r["locations"]),
                      other_versions=[_short(f) for f in r["other_versions"]])
                 for r in report["certificates"]]
         cols = ["common_name", "fingerprint", "not_valid_after", "days_remaining", "places", "assets",
-                "locations", "other_versions", "issuer", "san", "warning"]
+                "locations", "other_versions", "backup_only", "issuer", "san", "warning"]
         return rows, cols
     if view == "cas":
         cols = ["subject", "found_in_inventory", "not_valid_after", "expiry", "signs", "trusted_by",
                 "in_chain_of", "same_name_as_other_ca", "subject_key_id", "fingerprint", "warning"]
         return report["cas"], cols
     cols = ["id", "cluster", "namespace", "leaf", "issuer", "issuer_in_inventory", "chain_complete",
-            "truststore_trusts_own_ca", "unused_trusted_cas", "shared_with", "errors"]
+            "chain_source", "private_key", "truststore_trusts_own_ca", "unused_trusted_cas", "shared_with",
+            "backup_of", "errors"]
     return report["assets"], cols

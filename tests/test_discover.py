@@ -106,7 +106,8 @@ def test_tls_secret_becomes_pem_asset(cluster_secrets):
     asset, notes = discover_all(cluster_secrets)["web-tls"]
     assert asset == {"id": "web-tls", "cluster": "kind", "namespace": "web-prod", "cn": "www.example.com",
                      "certType": "pem", "keystore": {"secret": {"name": "web-tls", "key": "tls.crt"}},
-                     "notes": {"managed_by": "cert-manager (Certificate 'web')"}}
+                     "notes": {"private_key": "in Secret key 'tls.key'",
+                               "managed_by": "cert-manager (Certificate 'web')"}}
 
 
 def test_jks_with_passwords_found_and_verified(cluster_secrets):
@@ -185,6 +186,119 @@ def test_unrelated_name_with_base_in_the_middle_is_not_related():
     assert discover._related_by_name("billing", "billing-tls-pw")
     assert not discover._related_by_name("billing", "billing")
     assert not discover._related_by_name("billing", "billing-config")
+
+
+def test_private_key_is_reported_as_a_fact(cluster_secrets):
+    found = discover_all(cluster_secrets)
+    assert found["web-tls"][1]["private_key"] == "in Secret key 'tls.key'"
+    assert found["api-tls"][1]["private_key"] == "in the keystore"     # JKS PrivateKeyEntry
+    assert found["billing-tls"][1]["private_key"] == "in the keystore"  # PKCS12 key
+    # store not opened (password unknown): nothing is claimed
+    assert "private_key" not in found["orphan-p12"][1]
+    # a CA bundle has no key of its own
+    assert "private_key" not in found["lonely-ca"][1]
+    # the key never implies mTLS: web-tls has a key but no truststore and no clientAuth
+    assert "mtls" not in found["web-tls"][1]
+
+
+def test_private_key_not_found_and_in_the_same_file():
+    _, _, crt, key = pem_and_key("a.example.com")
+    found = {a["id"]: a for a, _ in discover.discover_namespace("ns", [
+        secret("only-crt", {"server.crt": crt}),
+        secret("bundle", {"server.pem": crt + key}),
+    ], "c", set())}
+    assert found["only-crt"]["notes"]["private_key"] == "not found next to the certificate"
+    assert found["bundle"]["notes"]["private_key"] == "in the same file"
+
+
+def test_chain_key_becomes_the_asset_chain():
+    # the layout of the renewal guide: generic Secret with tls.crt, tls.key, cacerts.pem
+    _, _, crt, key = pem_and_key("portal.example.com")
+    _, _, ca, _ = pem_and_key("Corp CA")
+    found = discover.discover_namespace("ns", [
+        secret("portal-tls", {"tls.crt": crt, "tls.key": key, "cacerts.pem": ca}),
+    ], "c", set())
+    assert len(found) == 1  # cacerts.pem is not a second keystore asset
+    asset = found[0][0]
+    assert asset["keystore"] == {"secret": {"name": "portal-tls", "key": "tls.crt"}}
+    assert asset["chain"] == {"secret": {"name": "portal-tls", "key": "cacerts.pem"}}
+    assert list(asset)[-2:] == ["chain", "notes"]  # chain before notes in the YAML
+    main.validate_config(asset, ["c"])
+
+
+@pytest.mark.parametrize("key", ["ca.crt", "chain.pem", "ca-bundle.crt", "cacert.pem", "intermediate.pem"])
+def test_chain_key_names(key):
+    _, _, crt, _ = pem_and_key("a.example.com")
+    _, _, ca, _ = pem_and_key("Corp CA")
+    found = discover.discover_namespace("ns", [secret("s", {"server.crt": crt, key: ca})], "c", set())
+    assert [a["chain"]["secret"]["key"] for a, _ in found] == [key]
+
+
+def test_fullchain_stays_a_keystore_and_chain_key_option():
+    _, _, crt, _ = pem_and_key("a.example.com")
+    _, _, ca, _ = pem_and_key("Corp CA")
+    s = secret("s", {"fullchain.pem": crt + ca, "issuers.pem": ca})
+    found = discover.discover_namespace("ns", [s], "c", set())
+    assert sorted(a["keystore"]["secret"]["key"] for a, _ in found) == ["fullchain.pem", "issuers.pem"]
+
+    options = discover.DiscoverOptions(chain_keys=("issuers.pem",))
+    found = discover.discover_namespace("ns", [s], "c", set(), options)
+    assert len(found) == 1
+    assert found[0][0]["chain"]["secret"]["key"] == "issuers.pem"
+
+
+def test_tls_secret_ca_crt_is_the_chain():
+    _, _, crt, key = pem_and_key("a.example.com")
+    _, _, ca, _ = pem_and_key("Corp CA")
+    found = discover.discover_namespace("ns", [
+        secret("a-tls", {"tls.crt": crt, "tls.key": key, "ca.crt": ca}, "kubernetes.io/tls"),
+        secret("b-tls", {"tls.crt": crt, "tls.key": key, "ca.crt": b""}, "kubernetes.io/tls"),
+    ], "c", set())
+    assets = {a["id"]: a for a, _ in found}
+    assert assets["a-tls"]["chain"] == {"secret": {"name": "a-tls", "key": "ca.crt"}}
+    assert "chain" not in assets["b-tls"]  # cert-manager writes an empty ca.crt for some issuers
+
+
+def test_ca_bundle_alone_is_a_truststore_and_java_cacerts(make_keystore):
+    _, _, ca, _ = pem_and_key("Corp CA")
+    found = discover.discover_namespace("ns", [
+        secret("corp-ca", {"ca.crt": ca}),
+        secret("java", {"keystore.jks": make_keystore(leaf_cn="j.example.com"),
+                        "cacerts": make_keystore(password="changeit"), "password": b"changeit"}),
+    ], "c", set())
+    assets = {a["id"]: a for a, _ in found}
+    assert assets["corp-ca"]["notes"]["content"].startswith("truststore only")
+    assert assets["java"]["truststore"]["secret"] == {"name": "java", "key": "cacerts"}
+    assert "chain" not in assets["java"]
+
+
+def test_backup_of():
+    names = {"api-tls", "api-tls-bck", "api-tls.backup-2024", "old-tls", "api"}
+    assert discover.backup_of("api-tls-bck", names) == "api-tls"
+    assert discover.backup_of("api-tls.backup-2024", names) == "api-tls"
+    assert discover.backup_of("api-tls-bck-20240101", names) == "api-tls"
+    assert discover.backup_of("old-tls", names) is None     # nothing called "old" exists
+    assert discover.backup_of("api-tls", names) is None
+    assert discover.backup_of("web-tls-bck", names) is None  # original not in the namespace
+    assert discover.backup_of("api-tls-prev", names) is None
+    assert discover.backup_of("api-tls-prev", names, ("prev",)) == "api-tls"
+
+
+def test_backups_are_left_out_unless_asked():
+    _, _, crt, key = pem_and_key("portal.example.com")
+    _, _, old_crt, old_key = pem_and_key("portal.example.com")
+    secrets = [secret("portal-tls", {"tls.crt": crt, "tls.key": key}, "kubernetes.io/tls"),
+               secret("portal-tls-bck", {"tls.crt": old_crt, "tls.key": old_key}, "kubernetes.io/tls")]
+    options = discover.DiscoverOptions()
+    found = discover.discover_namespace("ns", secrets, "c", set(), options)
+    assert [a["id"] for a, _ in found] == ["portal-tls"]
+    assert options.skipped_backups == [("ns", "portal-tls-bck", "portal-tls")]
+
+    options = discover.DiscoverOptions(include_backups=True)
+    found = {a["id"]: a for a, _ in discover.discover_namespace("ns", secrets, "c", set(), options)}
+    assert found["portal-tls-bck"]["notes"]["backup"] == "backup copy of Secret 'portal-tls'"
+    assert "backup" not in found["portal-tls"].get("notes", {})
+    assert options.skipped_backups == []
 
 
 def test_truststore_secret_attached_by_base_name(cluster_secrets):
@@ -280,6 +394,37 @@ def test_cli_discover_to_stdout(fake_discover, capsys):
     assert {a["id"] for a in inv["assets"]} >= {"web-tls", "api-tls", "billing-tls", "myapp-tls"}
     assert "keystore_password: 'password not found automatically" in out
     assert err.startswith("discovered ") and "with TODO values" in err
+
+
+def test_cli_backups_and_chain_options(fake_discover, tmp_path, capsys):
+    _, _, crt, key = pem_and_key("portal.example.com")
+    _, _, ca, _ = pem_and_key("Corp CA")
+    fake_discover["api"].namespaces["portal"] = [
+        secret("portal-tls", {"tls.crt": crt, "tls.key": key, "issuers.pem": ca}),
+        secret("portal-tls-bck", {"tls.crt": crt, "tls.key": key, "issuers.pem": ca}),
+        secret("portal-tls-prev", {"tls.crt": crt, "tls.key": key, "issuers.pem": ca}),
+    ]
+    code, out, err = run_discover(["-n", "portal"], capsys)
+    assert code == 0
+    ids = [a["id"] for a in yaml.safe_load(out)["assets"]]
+    assert "portal-tls-bck" not in ids and "portal-tls-prev-tls.crt" in ids
+    assert "1 backup Secret(s) left out (portal-tls-bck; see --include-backups)" in err
+
+    code, out, err = run_discover(["-n", "portal", "--backup-suffix", "prev", "--chain-key", "issuers.pem",
+                                   "--include-backups"], capsys)
+    assert code == 0
+    assets = {a["id"]: a for a in yaml.safe_load(out)["assets"]}
+    assert set(assets) == {"portal-tls", "portal-tls-bck", "portal-tls-prev"}
+    assert assets["portal-tls-prev"]["notes"]["backup"] == "backup copy of Secret 'portal-tls'"
+    assert assets["portal-tls"]["chain"]["secret"]["key"] == "issuers.pem"
+    assert "left out" not in err
+
+    # --update: a backup that is left out is not "gone" from the cluster
+    path = tmp_path / "inv.yaml"
+    path.write_text(out)
+    code, _, err = run_discover(["-n", "portal", "--update", str(path)], capsys)
+    assert code == 0, err
+    assert "not found in the cluster any more" not in err
 
 
 def test_cli_all_namespaces_skips_system_unless_asked(fake_discover, capsys):

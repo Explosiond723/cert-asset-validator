@@ -41,7 +41,7 @@ up() {
     "$PY" "$REPO_ROOT/e2e/make_fixtures.py" "$OUT/certs"
     local c="$OUT/certs"
 
-    for ns in web-prod api-prod billing-prod restricted cert-validator; do
+    for ns in web-prod api-prod billing-prod portal-prod restricted cert-validator; do
         kc create namespace "$ns" --dry-run=client -o yaml | kc apply -f - >/dev/null
     done
 
@@ -67,6 +67,16 @@ up() {
     printf 'p12pass' > "$c/p12-password"
     apply_secret generic billing-tls -n billing-prod --from-file=keystore.p12="$c/billing.p12"
     apply_secret generic billing-tls-pass -n billing-prod --from-file=keystorePassword="$c/p12-password"
+
+    # portal-prod: the layout of the renewal guide (infrastructure-guides, TLS/mTLS renewal on
+    # OpenShift): generic Secret with tls.crt + tls.key + cacerts.pem, and the <secret>-bck copy
+    # taken before the renewal, still holding the previous certificate
+    cp "$c/ca.pem" "$c/cacerts.pem"
+    apply_secret generic portal-tls -n portal-prod \
+        --from-file=tls.crt="$c/portal.crt" --from-file=tls.key="$c/portal.key" --from-file=cacerts.pem="$c/cacerts.pem"
+    apply_secret generic portal-tls-bck -n portal-prod \
+        --from-file=tls.crt="$c/portal-old.crt" --from-file=tls.key="$c/portal-old.key" \
+        --from-file=cacerts.pem="$c/cacerts.pem"
 
     # restricted: readable by the admin context only
     apply_secret tls restricted-tls -n restricted --cert "$c/web.crt" --key "$c/web.key"
@@ -147,6 +157,23 @@ assets:
     cn: www2.example.com
     certType: der
     keystore: {secret: {name: mismatch-tls, key: tls.crt}}
+
+  - id: portal              # OK (leaf + chain in cacerts.pem, verified by signature; key in tls.key)
+    cluster: kind-admin
+    namespace: portal-prod
+    cn: portal.example.com
+    certType: pem
+    mtls: true
+    keystore: {secret: {name: portal-tls, key: tls.crt}}
+    chain: {secret: {name: portal-tls, key: cacerts.pem}}
+
+  - id: portal-bck          # OK (backup copy, previous certificate)
+    cluster: kind-admin
+    namespace: portal-prod
+    cn: portal.example.com
+    certType: pem
+    keystore: {secret: {name: portal-tls-bck, key: tls.crt}}
+    chain: {secret: {name: portal-tls-bck, key: cacerts.pem}}
 
   - id: missing             # ERROR: Secret not found
     cluster: kind-admin
@@ -249,13 +276,18 @@ for path in sys.argv[1:]:
     sans = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     print(path + ": CN=" + cn + " SAN=" + ",".join(sans.get_values_for_type(x509.DNSName)))
 '
-PASSWORD_REFS='
+INVENTORY_REFS='
 import sys, yaml
 for asset in yaml.safe_load(open(sys.argv[1]))["assets"]:
     for role in ("keystore", "truststore"):
         ref = (asset.get(role) or {}).get("passwordRef")
         if ref:
             print(asset["id"] + " " + role + " -> " + ref["name"] + "/" + ref["key"])
+    if "chain" in asset:
+        print(asset["id"] + " chain -> " + asset["chain"]["secret"]["name"] + "/" + asset["chain"]["secret"]["key"])
+    for key, text in (asset.get("notes") or {}).items():
+        if key in ("private_key", "backup"):
+            print(asset["id"] + " " + key + ": " + text)
 '
 
 run() {
@@ -281,9 +313,13 @@ run() {
             "ERROR: keystore: Secret 'web-prod/does-not-exist' not found" \
             "ERROR: keystore: permission denied reading Secret 'restricted/restricted-tls'" \
             "ERROR: failed to load context 'context-that-does-not-exist'" \
-            "Live: web-limited  (context: $LIMITED_CTX)"
-        reject "wrong password" "not valid UTF-8" "unable to detect certificate format"
-        scenario 1 "validate --live: 3 OK, 3 warnings, 3 errors (see inventory comments)" \
+            "Live: web-limited  (context: $LIMITED_CTX)" \
+            "chain: portal-tls/cacerts.pem  [PEM, 1 cert(s)]" "private key: in Secret key 'tls.key'" \
+            "private key: in the keystore" "chain verified: yes" \
+            "mtls: true but no truststore is defined"
+        reject "wrong password" "not valid UTF-8" "unable to detect certificate format" "chain verified: no" \
+            "not signed by any CA" "but no private key"
+        scenario 1 "validate --live: 5 OK, 4 warnings, 3 errors (see inventory comments)" \
             "${main[@]}" validate "$inv" "${live[@]}"
         expect "LIVE_SUBJECT" "keystore: Secret 'web-prod/does-not-exist' not found" "expires in"
         scenario 1 "validate --live as table" \
@@ -324,32 +360,43 @@ run() {
         expect "error: restricted: permission denied reading Secret 'restricted/restricted-tls'"
         scenario 1 "csr --live on an asset the limited identity cannot read" \
             "${main[@]}" csr "$inv" --id restricted "${live[@]}"
-        expect "discovered 5 asset(s) in 3 namespace(s)"
+        expect "discovered 6 asset(s) in 4 namespace(s)" \
+            "1 backup Secret(s) left out (portal-tls-bck; see --include-backups)"
         reject "TODO values"
-        scenario 0 "discover: scan the test namespaces and write an inventory" \
-            "${main[@]}" discover -n web-prod -n api-prod -n billing-prod \
+        scenario 0 "discover: scan the test namespaces and write an inventory (backup left out)" \
+            "${main[@]}" discover -n web-prod -n api-prod -n billing-prod -n portal-prod \
             --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --output discovered.yaml --force
         # the passwords must have been found in the right Secrets (and verified by discover)
         expect "api-tls keystore -> api-pass/keystorePassword" \
             "api-tls truststore -> api-tls/truststorePassword" \
-            "billing-tls keystore -> billing-tls-pass/keystorePassword"
-        reject "TODO"
-        scenario 0 "discovered inventory: passwordRefs" "$PY" -c "$PASSWORD_REFS" discovered.yaml
-        expect "api-tls" "billing-tls" "web-tls" "certificate expires in"
-        reject "not found" "permission denied" "wrong password"
+            "billing-tls keystore -> billing-tls-pass/keystorePassword" \
+            "portal-tls chain -> portal-tls/cacerts.pem" \
+            "portal-tls private_key: in Secret key 'tls.key'" "web-tls private_key: in Secret key 'tls.key'" \
+            "api-tls private_key: in the keystore" "old-tls private_key: not found next to the certificate"
+        reject "TODO" "cacerts.pem-" "portal-tls-bck"
+        scenario 0 "discovered inventory: passwordRefs, chain, private key" "$PY" -c "$INVENTORY_REFS" discovered.yaml
+        expect "api-tls" "billing-tls" "web-tls" "portal-tls" "certificate expires in"
+        reject "not found" "permission denied" "wrong password" "not signed by any CA"
         scenario 0 "validate --live on the discovered inventory (passwords found and verified, warnings only)" \
             "${main[@]}" validate "$OUT/discovered.yaml" "${live[@]}" --format table
-        expect "no new assets, discovered.yaml unchanged, 5 already in the inventory"
+        expect "no new assets, discovered.yaml unchanged, 6 already in the inventory"
+        reject "not found in the cluster any more"
         scenario 0 "discover --update on the same namespaces: nothing new, file unchanged" \
-            "${main[@]}" discover -n web-prod -n api-prod -n billing-prod \
+            "${main[@]}" discover -n web-prod -n api-prod -n billing-prod -n portal-prod \
             --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --update discovered.yaml
+        expect "1 new asset(s) appended to discovered.yaml, 1 already in the inventory"
+        scenario 0 "discover --update --include-backups: the -bck Secret is added, marked as backup" \
+            "${main[@]}" discover -n portal-prod --include-backups \
+            --kubeconfig "$KCFG" --context "$ADMIN_CTX" --cluster-name kind-admin --update discovered.yaml
+        expect "portal-tls-bck backup: backup copy of Secret 'portal-tls'" "portal-tls-bck chain -> portal-tls-bck/cacerts.pem"
+        scenario 0 "discovered inventory: backup note" "$PY" -c "$INVENTORY_REFS" discovered.yaml
         expect "warning: permission denied listing secrets in namespace 'api-prod'" \
             "discovered 3 asset(s) in 1 namespace(s), 1 namespace(s) skipped"
         scenario 1 "discover with the limited identity: web-prod readable, api-prod denied" \
             "${main[@]}" discover -n web-prod -n api-prod --kubeconfig "$KCFG" --context "$LIMITED_CTX"
         # map: the fixture certs have no key identifiers, so CA linkage uses the DN fallback
         expect "CA: O=cert-asset-validator e2e,CN=e2e Test CA" \
-            "signs: api, billing, legacy, mismatch, web, web-limited" \
+            "signs: api, billing, legacy, mismatch, portal, portal-bck, web, web-limited" \
             "trusted by: api"
         reject "CA (not in the inventory)"
         scenario 1 "map --view cas: one CA signs every leaf (errors from the 3 broken assets)" \
@@ -360,10 +407,18 @@ run() {
         reject "same name, different certificate"
         scenario 0 "map --view certificates --cn www: same certificate in 4 places" \
             "${main[@]}" map "$inv" --kubeconfig "$KCFG" --context "$ADMIN_CTX" --view certificates --cn www
-        expect "truststore trusts its own CA: yes" "chain complete: no" "chain complete: yes" \
-            "same certificate also used by: ghost, restricted, web-limited"
+        expect "truststore trusts its own CA: yes" "chain complete: no" "chain complete: yes (from keystore)" \
+            "same certificate also used by: ghost, restricted, web-limited" \
+            "chain complete: yes (from Secret portal-tls (cacerts.pem))" "backup of: portal-tls" \
+            "private key: in Secret key 'tls.key'" "private key: in the keystore"
         scenario 1 "map --view assets: chains, truststore, shared certificates" \
             "${main[@]}" map "$inv" --kubeconfig "$KCFG" --context "$ADMIN_CTX" --view assets
+        # the old portal certificate lives only in the backup: not a renewal missing somewhere
+        expect "found in 1 place(s):" "[asset portal-tls-bck, keystore, backup]" \
+            "NOTE: found only in backups; current version(s):"
+        reject "same name, different certificate"
+        scenario 0 "map --view certificates --cn portal on the discovered inventory: backup recognised" \
+            "${main[@]}" map "$OUT/discovered.yaml" --kubeconfig "$KCFG" --view certificates --cn portal
         expect "PrivateKeyEntry" "CN=api.example.com" "DNS:api.example.com"
         scenario 0 "analyse the generated CSR inputs: JKS keystore from disk" \
             "${main[@]}" analyse "$OUT/certs/api-keystore.jks" --password changeit --format table

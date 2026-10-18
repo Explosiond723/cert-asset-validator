@@ -10,6 +10,9 @@ Everything is signed by a throw-away test CA. Files written to OUTDIR:
   billing.p12                 billing.internal.example.com, expires in 10 days (password: p12pass)
   legacy.crt                  old.example.com, expired 5 days ago
   mismatch.crt                other.example.com (inventory says www2.example.com / certType der)
+  portal.crt / portal.key     portal.example.com, serverAuth+clientAuth, leaf only (the chain is
+                              in a separate cacerts.pem, as in the renewal guide)
+  portal-old.crt / .key       the previous portal.example.com certificate, kept in the -bck Secret
 """
 import sys
 from datetime import datetime, timedelta, timezone
@@ -116,6 +119,13 @@ def main(out: Path) -> None:
 
     mismatch, _ = make_leaf(ca, "other.example.com", NOW - timedelta(days=1), NOW + timedelta(days=90), server)
     (out / "mismatch.crt").write_bytes(pem(mismatch))
+
+    portal, portal_key = make_leaf(ca, "portal.example.com", NOW - timedelta(days=1), NOW + timedelta(days=365), mtls)
+    (out / "portal.crt").write_bytes(pem(portal))
+    (out / "portal.key").write_bytes(key_pem(portal_key))
+    old, old_key = make_leaf(ca, "portal.example.com", NOW - timedelta(days=300), NOW + timedelta(days=65), mtls)
+    (out / "portal-old.crt").write_bytes(pem(old))
+    (out / "portal-old.key").write_bytes(key_pem(old_key))
 
     print(f"fixtures written to {out}")
 
